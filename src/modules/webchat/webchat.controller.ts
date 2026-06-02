@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
-import { processWebchatMessage } from "./webchat.service.js";
+import { processWebchatMessage, getPublicWebchatConfig } from "./webchat.service.js";
 
 const webchatMessageSchema = z.object({
     businessId: z.string().uuid(),
@@ -29,6 +29,34 @@ export async function handleWebchatMessage(req: Request, res: Response) {
 
         return res.status(400).json({
             error: "Invalid webchat request",
+        });
+    }
+}
+
+export async function getWebchatConfig(req: Request, res: Response) {
+    try {
+        const businessId = z.string().uuid().parse(req.params.businessId);
+
+        const config = await getPublicWebchatConfig(businessId);
+
+        return res.json(config);
+    } catch (error: unknown) {
+        console.error("Get webchat config error:", error);
+
+        if (error instanceof z.ZodError) {
+            return res.status(400).json({
+                error: "Invalid business id",
+                details: error.issues,
+            });
+        }
+
+        const message =
+            error instanceof Error
+                ? error.message
+                : "Could not load webchat config";
+
+        return res.status(400).json({
+            error: message,
         });
     }
 }

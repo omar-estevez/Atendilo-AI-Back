@@ -421,3 +421,43 @@ function analyzeConversation(
         aiSummary: aiReply.slice(0, 300),
     };
 }
+
+// *********************************************
+// *********************CONFIG******************
+// *********************************************
+
+
+export async function getPublicWebchatConfig(businessId: string) {
+    const { data: channel, error } = await supabase
+        .from("channels")
+        .select("id, business_id, type, name, status, config")
+        .eq("business_id", businessId)
+        .eq("type", "webchat")
+        .maybeSingle();
+
+    if (error) {
+        console.error("Get webchat config error:", error);
+        throw new Error(error.message);
+    }
+
+    const config = channel?.config as
+        | {
+            widget_title?: string;
+            welcome_message?: string;
+            primary_color?: string;
+            capture_leads?: boolean;
+        }
+        | null
+        | undefined;
+
+    return {
+        businessId,
+        channelId: channel?.id ?? null,
+        status: channel?.status ?? "inactive",
+        widgetTitle: config?.widget_title || "Lumora AI",
+        welcomeMessage:
+            config?.welcome_message || "Hi! I’m Lumora AI. How can I help you today?",
+        primaryColor: config?.primary_color || "#38bdf8",
+        captureLeads: config?.capture_leads ?? true,
+    };
+}
