@@ -6,7 +6,7 @@ export const router: Router = Router();
 router.get("/health", (_req, res) => {
     res.json({
         ok: true,
-        service: "lumora-api",
+        service: "atendilo-api",
     });
 });
 

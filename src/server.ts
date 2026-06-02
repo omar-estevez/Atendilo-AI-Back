@@ -16,7 +16,7 @@ app.use(express.json());
 
 app.get("/", (_req, res) => {
     res.json({
-        name: "Lumora API",
+        name: "Atendilo API",
         status: "running",
     });
 });
@@ -24,5 +24,5 @@ app.get("/", (_req, res) => {
 app.use("/api", router);
 
 app.listen(env.PORT, () => {
-    console.log(`Lumora API running on port ${env.PORT}`);
+    console.log(`Atendilo API running on port ${env.PORT}`);
 });

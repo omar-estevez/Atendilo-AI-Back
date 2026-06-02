@@ -1,9 +1,13 @@
 import { supabase } from "../../config/supabase.js";
 import { env } from "../../config/env.js";
 import { generateAiReply } from "../ai/ai.service.js";
-import type { WebchatMessageBody } from "./webchat.controller.js";
+import type {
+    WebchatMessageBody,
+    EndWebchatSessionBody,
+} from "./webchat.controller.js";
 
 type ContactId = string | null;
+type ConversationStatus = "open" | "pending" | "closed";
 
 type ConversationAnalysis = {
     intent: string;
@@ -12,6 +16,129 @@ type ConversationAnalysis = {
     aiScore: number;
     aiSummary: string;
 };
+
+type ChannelConfig = {
+    widget_title?: string;
+    widgetTitle?: string;
+    welcome_message?: string;
+    welcomeMessage?: string;
+    primary_color?: string;
+    primaryColor?: string;
+    capture_leads?: boolean;
+    captureLeads?: boolean;
+    ai_name?: string;
+    aiName?: string;
+    ai_instructions?: string;
+    custom_instructions?: string;
+    instructions?: string;
+    language?: string;
+    tone?: string;
+};
+
+function getChannelConfig(config: unknown): ChannelConfig {
+    if (!config || typeof config !== "object") {
+        return {};
+    }
+
+    return config as ChannelConfig;
+}
+
+function getAiNameFromChannel(input: {
+    channelName?: string | null;
+    channelConfig?: ChannelConfig | null;
+}) {
+    const { channelName, channelConfig } = input;
+
+    return (
+        channelConfig?.widget_title ||
+        channelConfig?.widgetTitle ||
+        channelConfig?.ai_name ||
+        channelConfig?.aiName ||
+        channelName ||
+        "Atendilo AI"
+    );
+}
+
+function getWelcomeMessage(input: {
+    widgetTitle: string;
+    channelConfig?: ChannelConfig | null;
+}) {
+    const { widgetTitle, channelConfig } = input;
+
+    return (
+        channelConfig?.welcome_message ||
+        channelConfig?.welcomeMessage ||
+        `Hi! I’m ${widgetTitle}. How can I help you today?`
+    );
+}
+
+function getPrimaryColor(channelConfig?: ChannelConfig | null) {
+    return (
+        channelConfig?.primary_color ||
+        channelConfig?.primaryColor ||
+        "#38bdf8"
+    );
+}
+
+function getCaptureLeads(channelConfig?: ChannelConfig | null) {
+    return channelConfig?.capture_leads ?? channelConfig?.captureLeads ?? true;
+}
+
+function isHumanAgentRequest(text: string) {
+    const value = String(text || "").toLowerCase();
+
+    return (
+        value.includes("agent") ||
+        value.includes("human") ||
+        value.includes("person") ||
+        value.includes("representative") ||
+        value.includes("asesor") ||
+        value.includes("agente") ||
+        value.includes("persona") ||
+        value.includes("humano") ||
+        value.includes("alguien real") ||
+        value.includes("hablar con alguien") ||
+        value.includes("quiero hablar") ||
+        value.includes("speak to someone") ||
+        value.includes("talk to someone") ||
+        value.includes("live agent") ||
+        value.includes("real person")
+    );
+}
+
+function getHumanHandoffReply(userMessage: string, businessName: string) {
+    const value = String(userMessage || "").toLowerCase();
+
+    const isSpanish =
+        value.includes("agente") ||
+        value.includes("asesor") ||
+        value.includes("persona") ||
+        value.includes("humano") ||
+        value.includes("hablar") ||
+        value.includes("quiero");
+
+    if (isSpanish) {
+        return `El equipo de ${businessName} está trabajando para conectarte con un agente. Por favor, espera un momento.`;
+    }
+
+    return `The ${businessName} team is working to connect you with an agent. Please wait a moment.`;
+}
+
+function getBusinessName(business: Record<string, any>) {
+    return (
+        business.name ||
+        business.business_name ||
+        business.company_name ||
+        "the business"
+    );
+}
+
+function getCurrentAiModel() {
+    if (env.AI_PROVIDER === "gemini") return env.GEMINI_MODEL;
+    if (env.AI_PROVIDER === "openai") return "gpt-4.1-mini";
+    if (env.AI_PROVIDER === "groq") return env.GROQ_MODEL;
+    return "mock";
+}
 
 export async function processWebchatMessage(input: WebchatMessageBody) {
     const { businessId, sessionId, message, visitor } = input;
@@ -27,12 +154,38 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         throw new Error("Business not found");
     }
 
+    const { data: webchatChannel, error: channelError } = await supabase
+        .from("channels")
+        .select("id, name, status, config")
+        .eq("business_id", businessId)
+        .eq("type", "webchat")
+        .maybeSingle();
+
+    if (channelError) {
+        console.error("Find webchat channel error:", channelError);
+        throw new Error(channelError.message);
+    }
+
+    if (!webchatChannel || webchatChannel.status !== "active") {
+        throw new Error("Web Chat is currently inactive.");
+    }
+
+    const channelConfig = getChannelConfig(webchatChannel.config);
+
+    const aiName = getAiNameFromChannel({
+        channelName: webchatChannel.name,
+        channelConfig,
+    });
+
+    const businessName = getBusinessName(business);
+
     const contactId = await findOrCreateContact({
         businessId,
         visitor,
     });
 
     let conversationId: string;
+    let currentConversationStatus: ConversationStatus = "open";
 
     const { data: existingSession, error: sessionError } = await supabase
         .from("webchat_sessions")
@@ -49,21 +202,43 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
     if (existingSession?.conversation_id) {
         conversationId = existingSession.conversation_id;
 
-        if (contactId) {
-            const { error: updateConversationContactError } = await supabase
+        const { data: currentConversation, error: currentConversationError } =
+            await supabase
                 .from("conversations")
-                .update({
-                    contact_id: contactId,
-                })
+                .select("status")
                 .eq("id", conversationId)
-                .is("contact_id", null);
+                .eq("business_id", businessId)
+                .maybeSingle();
 
-            if (updateConversationContactError) {
-                console.error(
-                    "Update conversation contact error:",
-                    updateConversationContactError
-                );
-            }
+        if (currentConversationError) {
+            console.error(
+                "Find current conversation status error:",
+                currentConversationError
+            );
+        }
+
+        currentConversationStatus =
+            (currentConversation?.status as ConversationStatus) || "open";
+
+        const conversationUpdate: Record<string, unknown> = {
+            channel_id: webchatChannel.id,
+        };
+
+        if (contactId) {
+            conversationUpdate.contact_id = contactId;
+        }
+
+        const { error: updateConversationContactError } = await supabase
+            .from("conversations")
+            .update(conversationUpdate)
+            .eq("id", conversationId)
+            .eq("business_id", businessId);
+
+        if (updateConversationContactError) {
+            console.error(
+                "Update conversation contact/channel error:",
+                updateConversationContactError
+            );
         }
     } else {
         const { data: conversation, error: conversationError } = await supabase
@@ -71,7 +246,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             .insert({
                 business_id: businessId,
                 contact_id: contactId,
-                channel_id: null,
+                channel_id: webchatChannel.id,
                 status: "open",
                 assigned_to: null,
                 last_message_at: new Date().toISOString(),
@@ -93,6 +268,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         }
 
         conversationId = conversation.id;
+        currentConversationStatus = "open";
 
         const { error: webchatSessionError } = await supabase
             .from("webchat_sessions")
@@ -109,6 +285,10 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             console.error("Create webchat session error:", webchatSessionError);
             throw new Error(webchatSessionError.message);
         }
+    }
+
+    if (currentConversationStatus === "closed") {
+        throw new Error("This conversation is closed.");
     }
 
     const { error: userMessageError } = await supabase.from("messages").insert({
@@ -130,6 +310,106 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         throw new Error(userMessageError.message);
     }
 
+    const customerRequestedAgent = isHumanAgentRequest(message);
+
+    if (customerRequestedAgent || currentConversationStatus === "pending") {
+        const handoffReply = customerRequestedAgent
+            ? getHumanHandoffReply(message, businessName)
+            : null;
+
+        if (handoffReply) {
+            const { error: handoffMessageError } = await supabase
+                .from("messages")
+                .insert({
+                    business_id: businessId,
+                    conversation_id: conversationId,
+                    sender_type: "ai",
+                    sender_profile_id: null,
+                    content: handoffReply,
+                    metadata: {
+                        channel: "webchat",
+                        type: "human_handoff",
+                        sessionId,
+                        aiName,
+                    },
+                });
+
+            if (handoffMessageError) {
+                console.error(
+                    "Create human handoff message error:",
+                    handoffMessageError
+                );
+                throw new Error(handoffMessageError.message);
+            }
+        }
+
+        const aiSummary =
+            handoffReply || "Customer is waiting for a human agent response.";
+
+        const { error: updatePendingError } = await supabase
+            .from("conversations")
+            .update({
+                status: "pending",
+                last_message_at: new Date().toISOString(),
+                contact_id: contactId,
+                channel_id: webchatChannel.id,
+                intent: "human_handoff",
+                urgency: "normal",
+                sentiment: "neutral",
+                ai_score: 90,
+                ai_summary: aiSummary,
+            })
+            .eq("id", conversationId)
+            .eq("business_id", businessId);
+
+        if (updatePendingError) {
+            console.error(
+                "Update conversation to pending error:",
+                updatePendingError
+            );
+            throw new Error(updatePendingError.message);
+        }
+
+        const analysis: ConversationAnalysis = {
+            intent: "human_handoff",
+            urgency: "normal",
+            sentiment: "neutral",
+            aiScore: 90,
+            aiSummary,
+        };
+
+        const { error: activityError } = await supabase
+            .from("ai_activity_logs")
+            .insert({
+                business_id: businessId,
+                conversation_id: conversationId,
+                contact_id: contactId,
+                type: "handoff",
+                status: "success",
+                title: "Customer requested human agent",
+                description: aiSummary,
+                metadata: {
+                    channel: "webchat",
+                    input: message,
+                    output: handoffReply,
+                    aiName,
+                    analysis,
+                },
+            });
+
+        if (activityError) {
+            console.error("Create handoff activity log error:", activityError);
+        }
+
+        return {
+            reply: handoffReply,
+            conversationId,
+            contactId,
+            status: "pending",
+            analysis,
+        };
+    }
+
     const { data: history, error: historyError } = await supabase
         .from("messages")
         .select("sender_type, content")
@@ -144,9 +424,14 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
     const aiReply = await generateAiReply({
         business,
+        aiName,
+        channelConfig,
         history:
             history?.map((item) => ({
-                role: item.sender_type === "ai" ? "assistant" : "user",
+                role:
+                    item.sender_type === "contact"
+                        ? ("user" as const)
+                        : ("assistant" as const),
                 content: item.content,
             })) ?? [],
         userMessage: message,
@@ -154,12 +439,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
     const analysis = analyzeConversation(message, aiReply);
 
-    const currentAiModel =
-        env.AI_PROVIDER === "gemini"
-            ? env.GEMINI_MODEL
-            : env.AI_PROVIDER === "openai"
-                ? "gpt-4.1-mini"
-                : "mock";
+    const currentAiModel = getCurrentAiModel();
 
     const { error: aiMessageError } = await supabase.from("messages").insert({
         business_id: businessId,
@@ -170,6 +450,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         metadata: {
             channel: "webchat",
             model: currentAiModel,
+            aiName,
             analysis,
         },
     });
@@ -182,15 +463,18 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
     const { error: updateConversationError } = await supabase
         .from("conversations")
         .update({
+            status: "open",
             last_message_at: new Date().toISOString(),
             contact_id: contactId,
+            channel_id: webchatChannel.id,
             intent: analysis.intent,
             urgency: analysis.urgency,
             sentiment: analysis.sentiment,
             ai_score: analysis.aiScore,
             ai_summary: analysis.aiSummary,
         })
-        .eq("id", conversationId);
+        .eq("id", conversationId)
+        .eq("business_id", businessId);
 
     if (updateConversationError) {
         console.error("Update conversation error:", updateConversationError);
@@ -204,13 +488,14 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             contact_id: contactId,
             type: "ai_reply",
             status: "success",
-            title: "AI replied to web chat message",
+            title: `${aiName} replied to web chat message`,
             description: aiReply,
             metadata: {
                 channel: "webchat",
                 input: message,
                 output: aiReply,
                 model: currentAiModel,
+                aiName,
                 analysis,
             },
         });
@@ -223,6 +508,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         reply: aiReply,
         conversationId,
         contactId,
+        status: "open",
         analysis,
     };
 }
@@ -278,15 +564,19 @@ async function findOrCreateContact(input: {
     }
 
     if (existingContactId) {
+        const updatePayload: Record<string, string | null> = {
+            source: "webchat",
+        };
+
+        if (fullName) updatePayload.full_name = fullName;
+        if (email) updatePayload.email = email;
+        if (phone) updatePayload.phone = phone;
+
         const { error: updateContactError } = await supabase
             .from("contacts")
-            .update({
-                full_name: fullName,
-                email,
-                phone,
-                source: "webchat",
-            })
-            .eq("id", existingContactId);
+            .update(updatePayload)
+            .eq("id", existingContactId)
+            .eq("business_id", businessId);
 
         if (updateContactError) {
             console.error("Update contact error:", updateContactError);
@@ -326,6 +616,8 @@ function analyzeConversation(
     let sentiment = "neutral";
     let aiScore = 60;
 
+    const isAgentRequest = isHumanAgentRequest(userMessage);
+
     const isBookingIntent =
         userText.includes("book") ||
         userText.includes("booking") ||
@@ -363,7 +655,10 @@ function analyzeConversation(
         userText.includes("qué hacen") ||
         userText.includes("que hacen");
 
-    if (isPricingIntent) {
+    if (isAgentRequest) {
+        intent = "human_handoff";
+        aiScore = 90;
+    } else if (isPricingIntent) {
         intent = "pricing_question";
         aiScore = 75;
     } else if (isBookingIntent) {
@@ -422,10 +717,113 @@ function analyzeConversation(
     };
 }
 
-// *********************************************
-// *********************CONFIG******************
-// *********************************************
+export async function getWebchatMessages(input: {
+    businessId: string;
+    sessionId: string;
+}) {
+    const { businessId, sessionId } = input;
 
+    const { data: existingSession, error: sessionError } = await supabase
+        .from("webchat_sessions")
+        .select("conversation_id")
+        .eq("business_id", businessId)
+        .eq("session_key", sessionId)
+        .maybeSingle();
+
+    if (sessionError) {
+        console.error("Find webchat session messages error:", sessionError);
+        throw new Error(sessionError.message);
+    }
+
+    if (!existingSession?.conversation_id) {
+        return {
+            conversationId: null,
+            status: null,
+            messages: [],
+        };
+    }
+
+    const { data: conversation, error: conversationError } = await supabase
+        .from("conversations")
+        .select("id, status")
+        .eq("id", existingSession.conversation_id)
+        .eq("business_id", businessId)
+        .maybeSingle();
+
+    if (conversationError) {
+        console.error("Get webchat conversation status error:", conversationError);
+        throw new Error(conversationError.message);
+    }
+
+    if (!conversation) {
+        return {
+            conversationId: existingSession.conversation_id,
+            status: null,
+            messages: [],
+        };
+    }
+
+    const { data: messages, error: messagesError } = await supabase
+        .from("messages")
+        .select("id, sender_type, content, created_at")
+        .eq("business_id", businessId)
+        .eq("conversation_id", existingSession.conversation_id)
+        .order("created_at", { ascending: true });
+
+    if (messagesError) {
+        console.error("Get webchat messages error:", messagesError);
+        throw new Error(messagesError.message);
+    }
+
+    return {
+        conversationId: existingSession.conversation_id,
+        status: conversation.status,
+        messages: messages ?? [],
+    };
+}
+
+export async function endWebchatSession(input: EndWebchatSessionBody) {
+    const { businessId, sessionId, reason = "user" } = input;
+
+    const { data: existingSession, error: sessionError } = await supabase
+        .from("webchat_sessions")
+        .select("conversation_id")
+        .eq("business_id", businessId)
+        .eq("session_key", sessionId)
+        .maybeSingle();
+
+    if (sessionError) {
+        console.error("Find webchat session to end error:", sessionError);
+        throw new Error(sessionError.message);
+    }
+
+    if (!existingSession?.conversation_id) {
+        return {
+            ended: false,
+            reason: "session_not_found",
+        };
+    }
+
+    const { error: updateConversationError } = await supabase
+        .from("conversations")
+        .update({
+            status: "closed",
+            last_message_at: new Date().toISOString(),
+        })
+        .eq("id", existingSession.conversation_id)
+        .eq("business_id", businessId);
+
+    if (updateConversationError) {
+        console.error("Close webchat conversation error:", updateConversationError);
+        throw new Error(updateConversationError.message);
+    }
+
+    return {
+        ended: true,
+        conversationId: existingSession.conversation_id,
+        reason,
+    };
+}
 
 export async function getPublicWebchatConfig(businessId: string) {
     const { data: channel, error } = await supabase
@@ -440,24 +838,23 @@ export async function getPublicWebchatConfig(businessId: string) {
         throw new Error(error.message);
     }
 
-    const config = channel?.config as
-        | {
-            widget_title?: string;
-            welcome_message?: string;
-            primary_color?: string;
-            capture_leads?: boolean;
-        }
-        | null
-        | undefined;
+    const config = getChannelConfig(channel?.config);
+
+    const widgetTitle = getAiNameFromChannel({
+        channelName: channel?.name,
+        channelConfig: config,
+    });
 
     return {
         businessId,
         channelId: channel?.id ?? null,
         status: channel?.status ?? "inactive",
-        widgetTitle: config?.widget_title || "Lumora AI",
-        welcomeMessage:
-            config?.welcome_message || "Hi! I’m Lumora AI. How can I help you today?",
-        primaryColor: config?.primary_color || "#38bdf8",
-        captureLeads: config?.capture_leads ?? true,
+        widgetTitle,
+        welcomeMessage: getWelcomeMessage({
+            widgetTitle,
+            channelConfig: config,
+        }),
+        primaryColor: getPrimaryColor(config),
+        captureLeads: getCaptureLeads(config),
     };
 }

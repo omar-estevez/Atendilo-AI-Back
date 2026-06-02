@@ -1,7 +1,7 @@
 {
   "name": "ai-lumura-api",
   "version": "1.0.0",
-  "description": "Lumora AI backend API",
+  "description": "Atendilo AI backend API",
   "main": "dist/server.js",
   "type": "module",
   "scripts": {

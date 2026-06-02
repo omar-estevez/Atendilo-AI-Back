@@ -8,11 +8,15 @@ const envSchema = z.object({
     SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
 
     OPENAI_API_KEY: z.string().optional(),
-    GEMINI_API_KEY: z.string().optional(),
 
+    GEMINI_API_KEY: z.string().optional(),
     GEMINI_MODEL: z.string().default("gemini-flash-latest"),
 
-    AI_PROVIDER: z.enum(["openai", "gemini", "mock"]).default("gemini"),
+    GROQ_API_KEY: z.string().optional(),
+    GROQ_MODEL: z.string().default("llama-3.1-8b-instant"),
+
+    AI_PROVIDER: z.enum(["mock", "gemini", "openai", "groq"])
+        .default("mock"),
 
     FRONTEND_URL: z.string().url().default("http://localhost:5173"),
 });
