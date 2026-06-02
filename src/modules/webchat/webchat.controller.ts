@@ -11,6 +11,7 @@ const webchatMessageSchema = z.object({
     businessId: z.string().uuid(),
     sessionId: z.string().min(1),
     message: z.string().min(1),
+    clientMessageId: z.string().optional(),
     visitor: z
         .object({
             name: z.string().optional(),

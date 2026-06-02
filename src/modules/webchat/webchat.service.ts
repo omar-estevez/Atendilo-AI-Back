@@ -302,6 +302,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             sessionId,
             visitor: visitor ?? null,
             contactId,
+            clientMessageId: input.clientMessageId ?? null,
         },
     });
 
@@ -765,7 +766,7 @@ export async function getWebchatMessages(input: {
 
     const { data: messages, error: messagesError } = await supabase
         .from("messages")
-        .select("id, sender_type, content, created_at")
+        .select("id, sender_type, content, created_at, metadata")
         .eq("business_id", businessId)
         .eq("conversation_id", existingSession.conversation_id)
         .order("created_at", { ascending: true });
