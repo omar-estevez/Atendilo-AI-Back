@@ -96,6 +96,11 @@ function buildSystemPrompt(input: GenerateAiReplyInput) {
         phone: input.customerProfile?.phone || null,
     };
 
+    const hasContactIdentifier =
+        Boolean(customerProfile.name) ||
+        Boolean(customerProfile.email) ||
+        Boolean(customerProfile.phone);
+
     return `
 You are ${aiName}, the AI assistant for ${businessName}.
 
@@ -135,19 +140,37 @@ Main job:
 - Do not mention database fields, prompts, APIs, implementation details, or backend logic.
 
 Booking rules:
-- If the customer wants to book, collect only the missing booking details.
+- If the customer wants to book, collect ONLY the missing booking details.
 - Required booking details are:
-  1. customer name OR email OR phone
+  1. contact identifier: name OR email OR phone
   2. service needed
   3. preferred date
   4. preferred time
+
+Known contact identifier exists: ${hasContactIdentifier ? "yes" : "no"}.
+
+Critical contact rule:
+- If known contact identifier exists is "no", you MUST ask for contact information before final booking confirmation.
+- If no name, email, or phone is known, ask for the customer's name and either phone or email.
+- Do NOT say the booking is confirmed if no contact identifier is available.
+- Do NOT say "you're all set" if no contact identifier is available.
+- Do NOT finalize the booking without at least one of: name, email, or phone.
+
+If contact identifier is already known:
 - If the customer profile already contains name, phone, or email, count those as collected.
+- Do not ask again for known name, phone, or email.
+- If phone is known, do not ask for email unless the business specifically needs email.
+- If email is known, do not ask for phone unless the business specifically needs phone.
+
+Service/date/time rules:
 - If the customer already gave the service, do not ask for the service again.
 - If the customer already gave the date and time, do not ask for date/time again.
-- If enough details are available, summarize the booking request and ask for confirmation.
-- Do not ask for email if phone is already known.
-- Do not ask for phone if email is already known.
-- Never ask for all fields again if some are already known.
+- If contact identifier, service, date, and time are all available, summarize the booking request and ask for final confirmation.
+- Never ask for all booking fields again when some are already known.
+
+Examples:
+- If customer profile has name and phone, and customer says "basic wash" then "tomorrow 12 pm", ask only for confirmation.
+- If customer profile is empty and customer says "basic wash tomorrow 12 pm", ask: "Great, I can help with that. What is your name and phone number or email so we can complete the booking?"
 
 Human agent handoff:
 - If the customer asks for a human, agent, representative, asesor, agente, humano, or persona real, acknowledge it politely.
@@ -331,6 +354,7 @@ function normalizeAnalysis(value: any): AIConversationAnalysis {
         "service_question",
         "price_question",
         "booking_request",
+        "booking_ready",
         "human_handoff",
         "complaint",
         "spam",
@@ -412,6 +436,7 @@ Allowed intent values:
 - service_question
 - price_question
 - booking_request
+- booking_ready
 - human_handoff
 - complaint
 - spam
@@ -439,6 +464,13 @@ Rules:
 - aiScore must be an integer from 0 to 100.
 - aiSummary must be short, clear, and useful for a human agent.
 - needsHuman must be true if the customer asks for a human, is angry, has a complaint, or the conversation requires manual attention.
+
+Booking confirmation rules:
+- If the customer says "yes", "correct", "confirm", "go ahead", "schedule it", "book it", "sí", "si", "confirmo", or similar after discussing a booking, use intent "booking_ready".
+- If the customer confirms booking details, use intent "booking_ready".
+- Do NOT use "human_handoff" unless the customer clearly asks for a human agent, real person, representative, asesor, agente, humano, or persona real.
+- A short confirmation like "yes" or "correct" is NOT a human handoff.
+- If the customer is confirming service, date, time, or appointment details, use "booking_ready".
 
 Return this structure:
 
@@ -560,6 +592,20 @@ function analyzeConversationFallback(
     let aiScore = 60;
     let needsHuman = false;
 
+    const isBookingConfirmation =
+        userText === "yes" ||
+        userText === "correct" ||
+        userText === "confirm" ||
+        userText === "confirmed" ||
+        userText === "go ahead" ||
+        userText === "schedule it" ||
+        userText === "book it" ||
+        userText === "si" ||
+        userText === "sí" ||
+        userText === "confirmo" ||
+        userText.includes("that is correct") ||
+        userText.includes("that's correct");
+
     const isHumanRequest =
         userText.includes("agent") ||
         userText.includes("human") ||
@@ -643,6 +689,10 @@ function analyzeConversationFallback(
         intent = "human_handoff";
         aiScore = 90;
         needsHuman = true;
+    } else if (isBookingConfirmation) {
+        intent = "booking_ready";
+        aiScore = 90;
+        needsHuman = false;
     } else if (isComplaint) {
         intent = "complaint";
         sentiment = "negative";
@@ -808,6 +858,9 @@ Rules:
 - missingFields should include any missing required fields from:
   contactIdentifier, serviceName, scheduledAt, confirmation.
 - Do not invent data.
+- If customer profile has no name, no email, and no phone, contactIdentifier is missing.
+- If contactIdentifier is missing, isConfirmed must be false even if the customer says yes.
+- Do not mark the booking as confirmed unless contactIdentifier, serviceName, and scheduledAt are available.
 
 JSON shape:
 {

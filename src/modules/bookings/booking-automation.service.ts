@@ -263,7 +263,12 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         };
     }
 
-    if (!fallbackCustomerName || !extracted.serviceName || !extracted.scheduledAt) {
+    const hasContactIdentifier =
+        Boolean(fallbackCustomerName) ||
+        Boolean(extracted.email) ||
+        Boolean(extracted.phone);
+
+    if (!hasContactIdentifier || !extracted.serviceName || !extracted.scheduledAt) {
         return {
             created: false,
             reason: "missing_required_booking_data",

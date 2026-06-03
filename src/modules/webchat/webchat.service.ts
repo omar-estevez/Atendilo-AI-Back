@@ -9,6 +9,7 @@ import type {
     EndWebchatSessionBody,
 } from "./webchat.controller.js";
 import { executeMatchingFlows } from "../ai-flows/ai-flows.service.js";
+import { processBookingAutomation } from "../bookings/booking-automation.service.js";
 
 type ContactId = string | null;
 type ConversationStatus = "open" | "pending" | "closed";
@@ -597,12 +598,22 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         source: "webchat",
     });
 
+    const bookingAutomationResult = await processBookingAutomation({
+        businessId,
+        conversationId,
+        contactId,
+        message,
+        aiReply,
+        analysis,
+    });
+
     return {
         reply: aiReply,
         conversationId,
-        contactId,
+        contactId: bookingAutomationResult.contactId || contactId,
         status: nextStatus,
         analysis,
+        booking: bookingAutomationResult,
     };
 }
 
