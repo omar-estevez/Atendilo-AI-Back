@@ -152,7 +152,7 @@ function getCurrentAiModel() {
     return "mock";
 }
 
-async function getContactProfile(contactId: string | null): Promise<CustomerProfile | null> {
+export async function getContactProfile(contactId: string | null): Promise<CustomerProfile | null> {
     if (!contactId) return null;
 
     const { data, error } = await supabase

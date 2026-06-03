@@ -2,6 +2,7 @@
 
 import { supabase } from "../../config/supabase.js";
 import { extractBookingDetailsWithAI } from "../ai/ai.service.js";
+import { getContactProfile } from "../webchat/webchat.service.js";
 
 type BookingAutomationInput = {
     businessId: string;
@@ -222,8 +223,11 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
 
     const history = await getConversationHistory(input.conversationId);
 
+    const contactProfile = await getContactProfile(input.contactId);
+
     const extracted = await extractBookingDetailsWithAI({
         currentDateIso: new Date().toISOString(),
+        customerProfile: contactProfile,
         messages: history.map((item) => ({
             senderType: item.sender_type,
             content: item.content,

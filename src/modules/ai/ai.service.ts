@@ -697,6 +697,11 @@ export type ExtractedBookingDetails = {
 
 type ExtractBookingDetailsInput = {
     currentDateIso: string;
+    customerProfile?: {
+        fullName?: string | null;
+        email?: string | null;
+        phone?: string | null;
+    } | null;
     messages: {
         senderType: string;
         content: string;
@@ -764,6 +769,12 @@ function buildBookingExtractionPrompt(input: ExtractBookingDetailsInput) {
         .map((message) => `${message.senderType}: ${message.content}`)
         .join("\n");
 
+    const customerProfile = {
+        name: input.customerProfile?.fullName || null,
+        email: input.customerProfile?.email || null,
+        phone: input.customerProfile?.phone || null,
+    };
+
     return `
 You extract booking details from a customer conversation.
 
@@ -773,9 +784,14 @@ ${input.currentDateIso}
 Conversation:
 ${historyText}
 
+Customer profile from web chat lead form:
+${JSON.stringify(customerProfile, null, 2)}
+
 Return ONLY valid JSON.
 
 Rules:
+- If customer profile has name, email, or phone, count that as a valid contact identifier.
+- Do not mark contactIdentifier as missing if customer profile has name, email, or phone.
 - isBookingIntent true if the customer wants to schedule, book, reserve, or confirm an appointment.
 - isConfirmed true only if the customer clearly confirms they want to book now, for example: yes, confirm, go ahead, schedule it, book it, sí, confirmo.
 - scheduledAt must be ISO 8601.
