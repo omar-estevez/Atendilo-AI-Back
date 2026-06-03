@@ -247,6 +247,9 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         phone: extracted.phone,
     });
 
+    const fallbackCustomerName =
+        extracted.customerName || (await getContactFallbackName(updatedContactId));
+
     if (!extracted.isConfirmed) {
         return {
             created: false,
@@ -256,7 +259,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         };
     }
 
-    if (!extracted.customerName || !extracted.serviceName || !extracted.scheduledAt) {
+    if (!fallbackCustomerName || !extracted.serviceName || !extracted.scheduledAt) {
         return {
             created: false,
             reason: "missing_required_booking_data",
@@ -303,7 +306,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
             business_id: input.businessId,
             contact_id: updatedContactId,
             conversation_id: input.conversationId,
-            customer_name: extracted.customerName,
+            customer_name: fallbackCustomerName,
             service_name: extracted.serviceName,
             scheduled_at: extracted.scheduledAt,
             status: "pending" satisfies BookingStatus,
@@ -333,7 +336,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         type: "appointment_scheduled",
         status: "success",
         title: "Booking created by AI",
-        description: `${extracted.customerName} requested ${extracted.serviceName}. Booking is pending confirmation.`,
+        description: `${fallbackCustomerName} requested ${extracted.serviceName}. Booking is pending confirmation.`,
         metadata: {
             source: "booking_automation",
             bookingId: booking.id,
@@ -348,4 +351,21 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         booking,
         contactId: updatedContactId,
     };
+}
+
+async function getContactFallbackName(contactId: string | null) {
+    if (!contactId) return null;
+
+    const { data, error } = await supabase
+        .from("contacts")
+        .select("full_name, email, phone")
+        .eq("id", contactId)
+        .maybeSingle();
+
+    if (error) {
+        console.error("Get contact fallback name error:", error);
+        return null;
+    }
+
+    return data?.full_name || data?.email || data?.phone || null;
 }
