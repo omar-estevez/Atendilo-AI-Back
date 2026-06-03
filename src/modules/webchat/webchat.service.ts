@@ -1,6 +1,9 @@
 import { supabase } from "../../config/supabase.js";
 import { env } from "../../config/env.js";
-import { generateAiReply, analyzeConversationWithAI } from "../ai/ai.service.js";
+import {
+    generateAiReply,
+    analyzeConversationWithAI,
+} from "../ai/ai.service.js";
 import type {
     WebchatMessageBody,
     EndWebchatSessionBody,
@@ -35,6 +38,12 @@ type ChannelConfig = {
     instructions?: string;
     language?: string;
     tone?: string;
+};
+
+type CustomerProfile = {
+    fullName: string | null;
+    email: string | null;
+    phone: string | null;
 };
 
 function getChannelConfig(config: unknown): ChannelConfig {
@@ -139,7 +148,29 @@ function getCurrentAiModel() {
     if (env.AI_PROVIDER === "gemini") return env.GEMINI_MODEL;
     if (env.AI_PROVIDER === "openai") return "gpt-4.1-mini";
     if (env.AI_PROVIDER === "groq") return env.GROQ_MODEL;
+
     return "mock";
+}
+
+async function getContactProfile(contactId: string | null): Promise<CustomerProfile | null> {
+    if (!contactId) return null;
+
+    const { data, error } = await supabase
+        .from("contacts")
+        .select("full_name, email, phone")
+        .eq("id", contactId)
+        .maybeSingle();
+
+    if (error) {
+        console.error("Get contact profile error:", error);
+        return null;
+    }
+
+    return {
+        fullName: data?.full_name || null,
+        email: data?.email || null,
+        phone: data?.phone || null,
+    };
 }
 
 export async function processWebchatMessage(input: WebchatMessageBody) {
@@ -188,7 +219,6 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
     let conversationId: string;
     let currentConversationStatus: ConversationStatus = "open";
-
     let isNewConversation = false;
 
     const { data: existingSession, error: sessionError } = await supabase
@@ -267,7 +297,6 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
         if (conversationError || !conversation) {
             console.error("Create conversation error:", conversationError);
-
             throw new Error(
                 conversationError?.message || "Could not create conversation"
             );
@@ -275,7 +304,6 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
         conversationId = conversation.id;
         currentConversationStatus = "open";
-
         isNewConversation = true;
 
         const { error: webchatSessionError } = await supabase
@@ -355,29 +383,31 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         const aiSummary =
             handoffReply || "Customer is waiting for a human agent response.";
 
+        const updatePayload: Record<string, unknown> = {
+            status: "pending",
+            last_message_at: new Date().toISOString(),
+            channel_id: webchatChannel.id,
+            intent: "human_handoff",
+            urgency: "normal",
+            sentiment: "neutral",
+            ai_score: 90,
+            ai_summary: aiSummary,
+            needs_human: true,
+            ai_analyzed_at: new Date().toISOString(),
+        };
+
+        if (contactId) {
+            updatePayload.contact_id = contactId;
+        }
+
         const { error: updatePendingError } = await supabase
             .from("conversations")
-            .update({
-                status: "pending",
-                last_message_at: new Date().toISOString(),
-                contact_id: contactId,
-                channel_id: webchatChannel.id,
-                intent: "human_handoff",
-                urgency: "normal",
-                sentiment: "neutral",
-                ai_score: 90,
-                ai_summary: aiSummary,
-                needs_human: true,
-                ai_analyzed_at: new Date().toISOString(),
-            })
+            .update(updatePayload)
             .eq("id", conversationId)
             .eq("business_id", businessId);
 
         if (updatePendingError) {
-            console.error(
-                "Update conversation to pending error:",
-                updatePendingError
-            );
+            console.error("Update conversation to pending error:", updatePendingError);
             throw new Error(updatePendingError.message);
         }
 
@@ -447,30 +477,31 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         throw new Error(historyError.message);
     }
 
+    const mappedHistory =
+        history?.map((item) => ({
+            role:
+                item.sender_type === "contact"
+                    ? ("user" as const)
+                    : ("assistant" as const),
+            content: item.content,
+        })) ?? [];
+
+    const customerProfile = await getContactProfile(contactId);
+
     const aiReply = await generateAiReply({
         business,
         aiName,
         channelConfig,
-        history:
-            history?.map((item) => ({
-                role:
-                    item.sender_type === "contact"
-                        ? ("user" as const)
-                        : ("assistant" as const),
-                content: item.content,
-            })) ?? [],
+        history: mappedHistory,
         userMessage: message,
+        customerProfile,
     });
 
     const analysis = await analyzeConversationWithAI({
         business,
         aiName,
         channelConfig,
-        history:
-            history?.map((item) => ({
-                role: item.sender_type === "contact" ? ("user" as const) : ("assistant" as const),
-                content: item.content,
-            })) ?? [],
+        history: mappedHistory,
         userMessage: message,
         aiReply,
     });
@@ -488,6 +519,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             model: currentAiModel,
             aiName,
             analysis,
+            customerProfile,
         },
     });
 
@@ -496,23 +528,30 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         throw new Error(aiMessageError.message);
     }
 
-    const nextStatus: ConversationStatus = analysis.needsHuman ? "pending" : "open";
+    const nextStatus: ConversationStatus = analysis.needsHuman
+        ? "pending"
+        : "open";
+
+    const updateConversationPayload: Record<string, unknown> = {
+        status: nextStatus,
+        last_message_at: new Date().toISOString(),
+        channel_id: webchatChannel.id,
+        intent: analysis.intent,
+        urgency: analysis.urgency,
+        sentiment: analysis.sentiment,
+        ai_score: analysis.aiScore,
+        ai_summary: analysis.aiSummary,
+        needs_human: analysis.needsHuman,
+        ai_analyzed_at: new Date().toISOString(),
+    };
+
+    if (contactId) {
+        updateConversationPayload.contact_id = contactId;
+    }
 
     const { error: updateConversationError } = await supabase
         .from("conversations")
-        .update({
-            status: nextStatus,
-            last_message_at: new Date().toISOString(),
-            contact_id: contactId,
-            channel_id: webchatChannel.id,
-            intent: analysis.intent,
-            urgency: analysis.urgency,
-            sentiment: analysis.sentiment,
-            ai_score: analysis.aiScore,
-            ai_summary: analysis.aiSummary,
-            needs_human: analysis.needsHuman,
-            ai_analyzed_at: new Date().toISOString(),
-        })
+        .update(updateConversationPayload)
         .eq("id", conversationId)
         .eq("business_id", businessId);
 
@@ -537,6 +576,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
                 model: currentAiModel,
                 aiName,
                 analysis,
+                customerProfile,
             },
         });
 
@@ -557,7 +597,13 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         source: "webchat",
     });
 
-    return { reply: aiReply, conversationId, contactId, status: nextStatus, analysis };
+    return {
+        reply: aiReply,
+        conversationId,
+        contactId,
+        status: nextStatus,
+        analysis,
+    };
 }
 
 async function findOrCreateContact(input: {
@@ -611,7 +657,7 @@ async function findOrCreateContact(input: {
     }
 
     if (existingContactId) {
-        const updatePayload: Record<string, string | null> = {
+        const updatePayload: Record<string, unknown> = {
             source: "webchat",
         };
 

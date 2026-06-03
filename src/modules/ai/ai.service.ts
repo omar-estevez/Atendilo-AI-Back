@@ -20,12 +20,19 @@ type ChannelConfig = {
     tone?: string;
 };
 
+type CustomerProfile = {
+    fullName?: string | null;
+    email?: string | null;
+    phone?: string | null;
+};
+
 type GenerateAiReplyInput = {
     business: Record<string, any>;
     history: MessageHistoryItem[];
     userMessage: string;
     aiName?: string;
     channelConfig?: ChannelConfig | null;
+    customerProfile?: CustomerProfile | null;
 };
 
 export async function generateAiReply(input: GenerateAiReplyInput) {
@@ -83,6 +90,12 @@ function buildSystemPrompt(input: GenerateAiReplyInput) {
     const customInstructions = getCustomInstructions(input);
     const tone = getPreferredTone(input);
 
+    const customerProfile = {
+        name: input.customerProfile?.fullName || null,
+        email: input.customerProfile?.email || null,
+        phone: input.customerProfile?.phone || null,
+    };
+
     return `
 You are ${aiName}, the AI assistant for ${businessName}.
 
@@ -95,10 +108,26 @@ Identity rules:
 - If the customer asks who you are, say you are ${aiName}, the virtual assistant for ${businessName}.
 
 Language rules:
-- Reply in the same language the customer uses.
-- If the customer writes in Spanish, reply in Spanish.
+- Reply ONLY in the same language as the customer's latest message.
+- The latest customer message is the source of truth for language.
+- Do not switch languages because of previous conversation history.
 - If the customer writes in English, reply in English.
-- Use a ${tone} tone.
+- If the customer writes in Spanish, reply in Spanish.
+- If the customer writes in another language, reply in that same language.
+- Do not translate the customer's message unless they ask for translation.
+
+Customer profile already known:
+${JSON.stringify(customerProfile, null, 2)}
+
+Booking rules:
+- If the customer wants to book, collect only the missing booking details.
+- Do NOT ask again for name, email, or phone if they are already available in the customer profile.
+- If name is already known, do not ask for the customer's name.
+- If phone is already known, do not ask for the phone number.
+- If email is already known, do not ask for the email.
+- Required booking details are: customer name, phone or email, service needed, preferred date, preferred time.
+- If the customer profile already contains name, phone, or email, count those as collected.
+- If enough details are available, summarize the booking request and ask for confirmation.
 
 Main job:
 - Answer customer questions clearly.
@@ -641,4 +670,215 @@ function analyzeConversationFallback(
                 : aiReply.slice(0, 300) || "Customer sent a message in the web chat.",
         needsHuman,
     };
+}
+
+export type ExtractedBookingDetails = {
+    isBookingIntent: boolean;
+    isConfirmed: boolean;
+    customerName: string | null;
+    email: string | null;
+    phone: string | null;
+    serviceName: string | null;
+    scheduledAt: string | null;
+    estimatedValue: number | null;
+    notes: string | null;
+    missingFields: string[];
+};
+
+type ExtractBookingDetailsInput = {
+    currentDateIso: string;
+    messages: {
+        senderType: string;
+        content: string;
+    }[];
+};
+
+function safeParseBookingJson(raw: string): ExtractedBookingDetails {
+    try {
+        const parsed = JSON.parse(raw);
+
+        return {
+            isBookingIntent: Boolean(parsed.isBookingIntent),
+            isConfirmed: Boolean(parsed.isConfirmed),
+            customerName:
+                typeof parsed.customerName === "string" && parsed.customerName.trim()
+                    ? parsed.customerName.trim()
+                    : null,
+            email:
+                typeof parsed.email === "string" && parsed.email.trim()
+                    ? parsed.email.trim().toLowerCase()
+                    : null,
+            phone:
+                typeof parsed.phone === "string" && parsed.phone.trim()
+                    ? parsed.phone.trim()
+                    : null,
+            serviceName:
+                typeof parsed.serviceName === "string" && parsed.serviceName.trim()
+                    ? parsed.serviceName.trim()
+                    : null,
+            scheduledAt:
+                typeof parsed.scheduledAt === "string" && parsed.scheduledAt.trim()
+                    ? parsed.scheduledAt.trim()
+                    : null,
+            estimatedValue:
+                parsed.estimatedValue === null || parsed.estimatedValue === undefined
+                    ? null
+                    : Number(parsed.estimatedValue),
+            notes:
+                typeof parsed.notes === "string" && parsed.notes.trim()
+                    ? parsed.notes.trim()
+                    : null,
+            missingFields: Array.isArray(parsed.missingFields)
+                ? parsed.missingFields.map(String)
+                : [],
+        };
+    } catch {
+        return {
+            isBookingIntent: false,
+            isConfirmed: false,
+            customerName: null,
+            email: null,
+            phone: null,
+            serviceName: null,
+            scheduledAt: null,
+            estimatedValue: null,
+            notes: null,
+            missingFields: ["parse_failed"],
+        };
+    }
+}
+
+function buildBookingExtractionPrompt(input: ExtractBookingDetailsInput) {
+    const historyText = input.messages
+        .slice(-30)
+        .map((message) => `${message.senderType}: ${message.content}`)
+        .join("\n");
+
+    return `
+You extract booking details from a customer conversation.
+
+Current date/time ISO:
+${input.currentDateIso}
+
+Conversation:
+${historyText}
+
+Return ONLY valid JSON.
+
+Rules:
+- isBookingIntent true if the customer wants to schedule, book, reserve, or confirm an appointment.
+- isConfirmed true only if the customer clearly confirms they want to book now, for example: yes, confirm, go ahead, schedule it, book it, sí, confirmo.
+- scheduledAt must be ISO 8601.
+- If customer says tomorrow, interpret it based on the current date.
+- If date/time is missing, scheduledAt must be null.
+- customerName can come from a name the customer gave in chat.
+- If the customer gave only an email or phone, keep customerName null unless a clear name exists.
+- serviceName must be the requested service. Example: basic wash, exterior wash, consultation.
+- estimatedValue should be a number only if the conversation clearly contains a price.
+- notes should summarize the booking request.
+- missingFields should include any missing required fields from:
+  customerName, serviceName, scheduledAt, confirmation.
+- Do not invent data.
+
+JSON shape:
+{
+  "isBookingIntent": true,
+  "isConfirmed": false,
+  "customerName": null,
+  "email": null,
+  "phone": null,
+  "serviceName": null,
+  "scheduledAt": null,
+  "estimatedValue": null,
+  "notes": null,
+  "missingFields": ["customerName", "serviceName", "scheduledAt", "confirmation"]
+}
+`.trim();
+}
+
+export async function extractBookingDetailsWithAI(
+    input: ExtractBookingDetailsInput
+): Promise<ExtractedBookingDetails> {
+    const prompt = buildBookingExtractionPrompt(input);
+
+    try {
+        if (env.AI_PROVIDER === "gemini") {
+            if (!gemini) throw new Error("Gemini client not configured");
+
+            const model = gemini.getGenerativeModel({
+                model: env.GEMINI_MODEL,
+            });
+
+            const result = await model.generateContent(prompt);
+            const raw = result.response.text();
+
+            return safeParseBookingJson(raw);
+        }
+
+        if (env.AI_PROVIDER === "groq") {
+            if (!groq) throw new Error("Groq client not configured");
+
+            const response = await groq.chat.completions.create({
+                model: env.GROQ_MODEL,
+                messages: [
+                    {
+                        role: "system",
+                        content:
+                            "You extract booking details from conversations and return strict JSON only.",
+                    },
+                    {
+                        role: "user",
+                        content: prompt,
+                    },
+                ],
+                temperature: 0.1,
+                max_tokens: 700,
+                response_format: {
+                    type: "json_object",
+                },
+            });
+
+            return safeParseBookingJson(
+                response.choices[0]?.message?.content || "{}"
+            );
+        }
+
+        if (!openai) throw new Error("OpenAI client not configured");
+
+        const response = await openai.chat.completions.create({
+            model: "gpt-4.1-mini",
+            messages: [
+                {
+                    role: "system",
+                    content:
+                        "You extract booking details from conversations and return strict JSON only.",
+                },
+                {
+                    role: "user",
+                    content: prompt,
+                },
+            ],
+            temperature: 0.1,
+            response_format: {
+                type: "json_object",
+            },
+        });
+
+        return safeParseBookingJson(response.choices[0]?.message?.content || "{}");
+    } catch (error) {
+        console.error("Extract booking details AI error:", error);
+
+        return {
+            isBookingIntent: false,
+            isConfirmed: false,
+            customerName: null,
+            email: null,
+            phone: null,
+            serviceName: null,
+            scheduledAt: null,
+            estimatedValue: null,
+            notes: null,
+            missingFields: ["ai_error"],
+        };
+    }
 }
