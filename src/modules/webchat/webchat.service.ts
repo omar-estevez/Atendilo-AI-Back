@@ -1,10 +1,11 @@
 import { supabase } from "../../config/supabase.js";
 import { env } from "../../config/env.js";
-import { generateAiReply } from "../ai/ai.service.js";
+import { generateAiReply, analyzeConversationWithAI } from "../ai/ai.service.js";
 import type {
     WebchatMessageBody,
     EndWebchatSessionBody,
 } from "./webchat.controller.js";
+import { executeMatchingFlows } from "../ai-flows/ai-flows.service.js";
 
 type ContactId = string | null;
 type ConversationStatus = "open" | "pending" | "closed";
@@ -15,6 +16,7 @@ type ConversationAnalysis = {
     sentiment: string;
     aiScore: number;
     aiSummary: string;
+    needsHuman: boolean;
 };
 
 type ChannelConfig = {
@@ -187,6 +189,8 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
     let conversationId: string;
     let currentConversationStatus: ConversationStatus = "open";
 
+    let isNewConversation = false;
+
     const { data: existingSession, error: sessionError } = await supabase
         .from("webchat_sessions")
         .select("conversation_id")
@@ -255,6 +259,8 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
                 sentiment: null,
                 ai_score: null,
                 ai_summary: null,
+                needs_human: false,
+                ai_analyzed_at: null,
             })
             .select("id")
             .single();
@@ -269,6 +275,8 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
         conversationId = conversation.id;
         currentConversationStatus = "open";
+
+        isNewConversation = true;
 
         const { error: webchatSessionError } = await supabase
             .from("webchat_sessions")
@@ -359,6 +367,8 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
                 sentiment: "neutral",
                 ai_score: 90,
                 ai_summary: aiSummary,
+                needs_human: true,
+                ai_analyzed_at: new Date().toISOString(),
             })
             .eq("id", conversationId)
             .eq("business_id", businessId);
@@ -377,6 +387,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             sentiment: "neutral",
             aiScore: 90,
             aiSummary,
+            needsHuman: true,
         };
 
         const { error: activityError } = await supabase
@@ -401,6 +412,19 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         if (activityError) {
             console.error("Create handoff activity log error:", activityError);
         }
+
+        await executeMatchingFlows({
+            businessId,
+            conversationId,
+            contactId,
+            analysis: {
+                ...analysis,
+                needsHuman: true,
+            },
+            isNewConversation,
+            followUpRequired: false,
+            source: "webchat",
+        });
 
         return {
             reply: handoffReply,
@@ -438,7 +462,18 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         userMessage: message,
     });
 
-    const analysis = analyzeConversation(message, aiReply);
+    const analysis = await analyzeConversationWithAI({
+        business,
+        aiName,
+        channelConfig,
+        history:
+            history?.map((item) => ({
+                role: item.sender_type === "contact" ? ("user" as const) : ("assistant" as const),
+                content: item.content,
+            })) ?? [],
+        userMessage: message,
+        aiReply,
+    });
 
     const currentAiModel = getCurrentAiModel();
 
@@ -461,10 +496,12 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         throw new Error(aiMessageError.message);
     }
 
+    const nextStatus: ConversationStatus = analysis.needsHuman ? "pending" : "open";
+
     const { error: updateConversationError } = await supabase
         .from("conversations")
         .update({
-            status: "open",
+            status: nextStatus,
             last_message_at: new Date().toISOString(),
             contact_id: contactId,
             channel_id: webchatChannel.id,
@@ -473,6 +510,8 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             sentiment: analysis.sentiment,
             ai_score: analysis.aiScore,
             ai_summary: analysis.aiSummary,
+            needs_human: analysis.needsHuman,
+            ai_analyzed_at: new Date().toISOString(),
         })
         .eq("id", conversationId)
         .eq("business_id", businessId);
@@ -505,13 +544,20 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         console.error("Create AI activity log error:", activityError);
     }
 
-    return {
-        reply: aiReply,
+    await executeMatchingFlows({
+        businessId,
         conversationId,
         contactId,
-        status: "open",
-        analysis,
-    };
+        analysis: {
+            ...analysis,
+            needsHuman: analysis.intent === "human_handoff",
+        },
+        isNewConversation,
+        followUpRequired: false,
+        source: "webchat",
+    });
+
+    return { reply: aiReply, conversationId, contactId, status: nextStatus, analysis };
 }
 
 async function findOrCreateContact(input: {
@@ -604,118 +650,6 @@ async function findOrCreateContact(input: {
     }
 
     return contact.id as string;
-}
-
-function analyzeConversation(
-    userMessage: string,
-    aiReply: string
-): ConversationAnalysis {
-    const userText = userMessage.toLowerCase();
-
-    let intent = "general_question";
-    let urgency = "normal";
-    let sentiment = "neutral";
-    let aiScore = 60;
-
-    const isAgentRequest = isHumanAgentRequest(userMessage);
-
-    const isBookingIntent =
-        userText.includes("book") ||
-        userText.includes("booking") ||
-        userText.includes("appointment") ||
-        userText.includes("schedule") ||
-        userText.includes("available") ||
-        userText.includes("availability") ||
-        userText.includes("tomorrow") ||
-        userText.includes("today") ||
-        userText.includes("cita") ||
-        userText.includes("agendar") ||
-        userText.includes("disponible");
-
-    const isPricingIntent =
-        userText.includes("price") ||
-        userText.includes("cost") ||
-        userText.includes("how much") ||
-        userText.includes("quote") ||
-        userText.includes("estimate") ||
-        userText.includes("pricing") ||
-        userText.includes("precio") ||
-        userText.includes("cuanto") ||
-        userText.includes("cuánto") ||
-        userText.includes("cotización");
-
-    const isServiceQuestion =
-        userText.includes("service") ||
-        userText.includes("services") ||
-        userText.includes("what do you do") ||
-        userText.includes("what can you do") ||
-        userText.includes("what can i do") ||
-        userText.includes("help") ||
-        userText.includes("servicio") ||
-        userText.includes("servicios") ||
-        userText.includes("qué hacen") ||
-        userText.includes("que hacen");
-
-    if (isAgentRequest) {
-        intent = "human_handoff";
-        aiScore = 90;
-    } else if (isPricingIntent) {
-        intent = "pricing_question";
-        aiScore = 75;
-    } else if (isBookingIntent) {
-        intent = "booking_request";
-        aiScore = 85;
-    } else if (isServiceQuestion) {
-        intent = "service_question";
-        aiScore = 65;
-    }
-
-    const isUrgent =
-        userText.includes("urgent") ||
-        userText.includes("asap") ||
-        userText.includes("today") ||
-        userText.includes("now") ||
-        userText.includes("right now") ||
-        userText.includes("ahora") ||
-        userText.includes("urgente");
-
-    if (isUrgent) {
-        urgency = "high";
-        aiScore = Math.max(aiScore, 90);
-    }
-
-    const isPositive =
-        userText.includes("thank") ||
-        userText.includes("thanks") ||
-        userText.includes("great") ||
-        userText.includes("perfect") ||
-        userText.includes("awesome") ||
-        userText.includes("excelente") ||
-        userText.includes("gracias") ||
-        userText.includes("perfecto");
-
-    const isNegative =
-        userText.includes("bad") ||
-        userText.includes("angry") ||
-        userText.includes("problem") ||
-        userText.includes("complaint") ||
-        userText.includes("malo") ||
-        userText.includes("problema") ||
-        userText.includes("queja");
-
-    if (isNegative) {
-        sentiment = "negative";
-    } else if (isPositive) {
-        sentiment = "positive";
-    }
-
-    return {
-        intent,
-        urgency,
-        sentiment,
-        aiScore,
-        aiSummary: aiReply.slice(0, 300),
-    };
 }
 
 export async function getWebchatMessages(input: {

@@ -264,3 +264,381 @@ function generateSafeFallbackReply(input: GenerateAiReplyInput) {
 
     return `Hi! I’m ${aiName}, the virtual assistant for ${businessName}. How can I help you today?`;
 }
+
+type AnalyzeConversationInput = {
+    business: Record<string, any>;
+    history: {
+        role: "user" | "assistant" | "system";
+        content: string;
+    }[];
+    userMessage: string;
+    aiReply?: string;
+    aiName?: string;
+    channelConfig?: ChannelConfig | null;
+};
+
+export type AIConversationAnalysis = {
+    intent: string;
+    urgency: string;
+    sentiment: string;
+    aiScore: number;
+    aiSummary: string;
+    needsHuman: boolean;
+};
+
+function normalizeAnalysis(value: any): AIConversationAnalysis {
+    const allowedIntents = [
+        "general_question",
+        "service_question",
+        "price_question",
+        "booking_request",
+        "human_handoff",
+        "complaint",
+        "spam",
+        "unknown",
+    ];
+
+    const allowedUrgency = ["low", "normal", "high", "urgent"];
+    const allowedSentiment = ["positive", "neutral", "negative", "angry"];
+
+    const intent = allowedIntents.includes(value?.intent)
+        ? value.intent
+        : "unknown";
+
+    const urgency = allowedUrgency.includes(value?.urgency)
+        ? value.urgency
+        : "normal";
+
+    const sentiment = allowedSentiment.includes(value?.sentiment)
+        ? value.sentiment
+        : "neutral";
+
+    const aiScoreNumber = Number(value?.aiScore ?? value?.ai_score ?? 60);
+
+    return {
+        intent,
+        urgency,
+        sentiment,
+        aiScore: Math.max(0, Math.min(100, Math.round(aiScoreNumber))),
+        aiSummary:
+            typeof value?.aiSummary === "string"
+                ? value.aiSummary
+                : typeof value?.ai_summary === "string"
+                    ? value.ai_summary
+                    : "No AI summary available.",
+        needsHuman: Boolean(value?.needsHuman ?? value?.needs_human ?? false),
+    };
+}
+
+function buildAnalyzePrompt(input: AnalyzeConversationInput) {
+    const businessName = getBusinessName(input.business);
+    const aiName = getAiName({
+        business: input.business,
+        history: input.history,
+        userMessage: input.userMessage,
+        aiName: input.aiName,
+        channelConfig: input.channelConfig,
+    });
+
+    const historyText =
+        input.history.length > 0
+            ? input.history
+                .slice(-15)
+                .map((item) => `${item.role.toUpperCase()}: ${item.content}`)
+                .join("\n")
+            : "No previous messages.";
+
+    return `
+You are an AI conversation analyst for a business messaging dashboard.
+
+Business name:
+${businessName}
+
+AI assistant name:
+${aiName}
+
+Conversation history:
+${historyText}
+
+Latest customer message:
+${input.userMessage}
+
+AI reply:
+${input.aiReply || ""}
+
+Return ONLY valid JSON.
+
+Allowed intent values:
+- general_question
+- service_question
+- price_question
+- booking_request
+- human_handoff
+- complaint
+- spam
+- unknown
+
+Allowed urgency values:
+- low
+- normal
+- high
+- urgent
+
+Allowed sentiment values:
+- positive
+- neutral
+- negative
+- angry
+
+Rules:
+- If the customer asks for an agent, human, person, representative, asesor, agente, humano, persona real, or says "agent", use intent "human_handoff".
+- If the customer wants to book, schedule, reserve, make an appointment, or asks availability, use intent "booking_request".
+- If the customer asks price, cost, quote, estimate, how much, precio, cuánto, or cotización, use intent "price_question".
+- If the customer asks what services are offered, use intent "service_question".
+- If the customer complains, use intent "complaint".
+- If the customer is angry, sentiment must be "angry" and urgency should be "high" or "urgent".
+- aiScore must be an integer from 0 to 100.
+- aiSummary must be short, clear, and useful for a human agent.
+- needsHuman must be true if the customer asks for a human, is angry, has a complaint, or the conversation requires manual attention.
+
+Return this structure:
+
+{
+  "intent": "general_question",
+  "urgency": "normal",
+  "sentiment": "neutral",
+  "aiScore": 60,
+  "aiSummary": "Customer is asking a general question.",
+  "needsHuman": false
+}
+`.trim();
+}
+
+export async function analyzeConversationWithAI(
+    input: AnalyzeConversationInput
+): Promise<AIConversationAnalysis> {
+    if (env.AI_PROVIDER === "mock") {
+        return analyzeConversationFallback(input);
+    }
+
+    const prompt = buildAnalyzePrompt(input);
+
+    try {
+        if (env.AI_PROVIDER === "gemini") {
+            if (!gemini) {
+                throw new Error("Gemini client not configured");
+            }
+
+            const model = gemini.getGenerativeModel({
+                model: env.GEMINI_MODEL,
+            });
+
+            const result = await model.generateContent(prompt);
+            const raw = result.response.text();
+
+            return normalizeAnalysis(JSON.parse(raw));
+        }
+
+        if (env.AI_PROVIDER === "groq") {
+            if (!groq) {
+                throw new Error("Groq client not configured");
+            }
+
+            const response = await groq.chat.completions.create({
+                model: env.GROQ_MODEL,
+                messages: [
+                    {
+                        role: "system",
+                        content:
+                            "You analyze customer support conversations and return strict JSON only.",
+                    },
+                    {
+                        role: "user",
+                        content: prompt,
+                    },
+                ],
+                temperature: 0.2,
+                max_tokens: 500,
+                response_format: {
+                    type: "json_object",
+                },
+            });
+
+            const raw = response.choices[0]?.message?.content;
+
+            if (!raw) {
+                throw new Error("Empty Groq analysis response");
+            }
+
+            return normalizeAnalysis(JSON.parse(raw));
+        }
+
+        if (!openai) {
+            throw new Error("OpenAI client not configured");
+        }
+
+        const response = await openai.chat.completions.create({
+            model: "gpt-4.1-mini",
+            messages: [
+                {
+                    role: "system",
+                    content:
+                        "You analyze customer support conversations and return strict JSON only.",
+                },
+                {
+                    role: "user",
+                    content: prompt,
+                },
+            ],
+            temperature: 0.2,
+            response_format: {
+                type: "json_object",
+            },
+        });
+
+        const raw = response.choices[0]?.message?.content;
+
+        if (!raw) {
+            throw new Error("Empty OpenAI analysis response");
+        }
+
+        return normalizeAnalysis(JSON.parse(raw));
+    } catch (error) {
+        console.error("Analyze conversation AI error:", error);
+        return analyzeConversationFallback(input);
+    }
+}
+
+function analyzeConversationFallback(
+    input: AnalyzeConversationInput
+): AIConversationAnalysis {
+    const userText = input.userMessage.toLowerCase();
+    const aiReply = input.aiReply || "";
+
+    let intent = "general_question";
+    let urgency = "normal";
+    let sentiment = "neutral";
+    let aiScore = 60;
+    let needsHuman = false;
+
+    const isHumanRequest =
+        userText.includes("agent") ||
+        userText.includes("human") ||
+        userText.includes("person") ||
+        userText.includes("representative") ||
+        userText.includes("asesor") ||
+        userText.includes("agente") ||
+        userText.includes("persona") ||
+        userText.includes("humano") ||
+        userText.includes("alguien real") ||
+        userText.includes("hablar con alguien") ||
+        userText.includes("quiero hablar") ||
+        userText.includes("speak to someone") ||
+        userText.includes("talk to someone") ||
+        userText.includes("live agent") ||
+        userText.includes("real person");
+
+    const isBooking =
+        userText.includes("book") ||
+        userText.includes("booking") ||
+        userText.includes("appointment") ||
+        userText.includes("schedule") ||
+        userText.includes("available") ||
+        userText.includes("availability") ||
+        userText.includes("tomorrow") ||
+        userText.includes("today") ||
+        userText.includes("cita") ||
+        userText.includes("agendar") ||
+        userText.includes("disponible");
+
+    const isPrice =
+        userText.includes("price") ||
+        userText.includes("cost") ||
+        userText.includes("how much") ||
+        userText.includes("quote") ||
+        userText.includes("estimate") ||
+        userText.includes("pricing") ||
+        userText.includes("precio") ||
+        userText.includes("cuanto") ||
+        userText.includes("cuánto") ||
+        userText.includes("cotización");
+
+    const isService =
+        userText.includes("service") ||
+        userText.includes("services") ||
+        userText.includes("help") ||
+        userText.includes("servicio") ||
+        userText.includes("servicios") ||
+        userText.includes("qué hacen") ||
+        userText.includes("que hacen");
+
+    const isComplaint =
+        userText.includes("bad") ||
+        userText.includes("angry") ||
+        userText.includes("problem") ||
+        userText.includes("complaint") ||
+        userText.includes("malo") ||
+        userText.includes("problema") ||
+        userText.includes("queja");
+
+    const isUrgent =
+        userText.includes("urgent") ||
+        userText.includes("asap") ||
+        userText.includes("today") ||
+        userText.includes("now") ||
+        userText.includes("right now") ||
+        userText.includes("ahora") ||
+        userText.includes("urgente");
+
+    const isPositive =
+        userText.includes("thank") ||
+        userText.includes("thanks") ||
+        userText.includes("great") ||
+        userText.includes("perfect") ||
+        userText.includes("awesome") ||
+        userText.includes("excelente") ||
+        userText.includes("gracias") ||
+        userText.includes("perfecto");
+
+    if (isHumanRequest) {
+        intent = "human_handoff";
+        aiScore = 90;
+        needsHuman = true;
+    } else if (isComplaint) {
+        intent = "complaint";
+        sentiment = "negative";
+        urgency = "high";
+        aiScore = 90;
+        needsHuman = true;
+    } else if (isPrice) {
+        intent = "price_question";
+        aiScore = 75;
+    } else if (isBooking) {
+        intent = "booking_request";
+        aiScore = 85;
+    } else if (isService) {
+        intent = "service_question";
+        aiScore = 65;
+    }
+
+    if (isUrgent) {
+        urgency = "high";
+        aiScore = Math.max(aiScore, 90);
+    }
+
+    if (isPositive && sentiment === "neutral") {
+        sentiment = "positive";
+    }
+
+    return {
+        intent,
+        urgency,
+        sentiment,
+        aiScore,
+        aiSummary:
+            intent === "human_handoff"
+                ? "Customer is waiting for a human agent response."
+                : aiReply.slice(0, 300) || "Customer sent a message in the web chat.",
+        needsHuman,
+    };
+}
