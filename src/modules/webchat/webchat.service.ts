@@ -629,6 +629,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         history: mappedHistory,
         userMessage: message,
         customerProfile,
+        captureLeads: getCaptureLeads(channelConfig),
     });
 
     const analysis = await analyzeConversationWithAI({
