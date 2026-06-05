@@ -1,6 +1,5 @@
 import { supabase } from "../../config/supabase.js";
 import { extractBookingDetailsWithAI } from "../ai/ai.service.js";
-import { getContactProfile } from "../webchat/webchat.service.js";
 
 type BookingAutomationInput = {
     businessId: string;
@@ -17,11 +16,11 @@ type BookingAutomationInput = {
 
 type BookingStatus = "pending" | "confirmed" | "completed" | "cancelled";
 
-function addMinutes(date: Date, minutes: number) {
-    return new Date(date.getTime() + minutes * 60 * 1000);
-}
-
 type BusinessRecord = Record<string, any>;
+
+type SuggestedBookingSlot = {
+    scheduledAt: string;
+};
 
 type ConversationHistoryItem = {
     sender_type: string;
@@ -30,19 +29,53 @@ type ConversationHistoryItem = {
     metadata?: Record<string, any> | null;
 };
 
+type ExtractedBookingDetails = {
+    isBookingIntent: boolean;
+    isConfirmed: boolean;
+    customerName: string | null;
+    email: string | null;
+    phone: string | null;
+    serviceName: string | null;
+    scheduledAt: string | null;
+    estimatedValue: number | null;
+    durationMinutes: number | null;
+    notes: string | null;
+    missingFields: string[];
+};
+
 type LastBookingContext = {
     serviceName: string | null;
     scheduledAt: string | null;
     durationMinutes: number | null;
 };
 
-type SuggestedBookingSlot = {
-    scheduledAt: string;
+type ExistingBookingRecord = {
+    id: string;
+    business_id: string;
+    contact_id: string | null;
+    conversation_id: string | null;
+    customer_name: string | null;
+    service_name: string | null;
+    scheduled_at: string | null;
+    status: BookingStatus;
+    estimated_value: number | null;
+    notes: string | null;
+};
+
+type TimeChoice = {
+    hour: number;
+    minute: number;
+    period: "am" | "pm" | null;
 };
 
 const DEFAULT_BOOKING_DURATION_MINUTES = 60;
 const SLOT_STEP_MINUTES = 30;
 const MAX_SUGGESTED_SLOTS = 3;
+const MAX_AVAILABILITY_LOOKUP_SLOTS = 5;
+
+function addMinutes(date: Date, minutes: number) {
+    return new Date(date.getTime() + minutes * 60 * 1000);
+}
 
 function getBusinessSettings(business?: BusinessRecord | null) {
     if (!business?.settings || typeof business.settings !== "object") {
@@ -235,7 +268,7 @@ function getBusinessHoursForDateKey(
 
     if (!businessHours.length) return null;
 
-    const noonUtc = zonedTimeToUtc(dateKey, "12:00", timeZone);
+    const noonUtc = zonedTimeToUtc(dateKey, "12:00 pm", timeZone);
 
     if (!noonUtc) return null;
 
@@ -258,6 +291,74 @@ function getBusinessHoursForDateKey(
         open: dayHours.open,
         close: dayHours.close,
     };
+}
+
+function normalizeText(value: unknown) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[^\w\s+áéíóúñü]/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function getServiceDurationMinutes(
+    business: BusinessRecord | null,
+    serviceName: unknown,
+    fallback = DEFAULT_BOOKING_DURATION_MINUTES
+) {
+    const settings = getBusinessSettings(business);
+    const services = Array.isArray(settings.services) ? settings.services : [];
+    const normalizedServiceName = normalizeText(serviceName);
+
+    const matchedService = services.find((service: Record<string, any>) => {
+        const serviceTitle = normalizeText(service.name || service.title);
+
+        if (!serviceTitle || !normalizedServiceName) return false;
+
+        return (
+            serviceTitle === normalizedServiceName ||
+            normalizedServiceName.includes(serviceTitle) ||
+            serviceTitle.includes(normalizedServiceName)
+        );
+    });
+
+    const duration = Number(
+        matchedService?.durationMinutes ||
+        matchedService?.duration_minutes ||
+        matchedService?.duration
+    );
+
+    return Number.isFinite(duration) && duration > 0 ? duration : fallback;
+}
+
+function roundUpToStep(date: Date, stepMinutes: number) {
+    const stepMs = stepMinutes * 60 * 1000;
+
+    return new Date(Math.ceil(date.getTime() / stepMs) * stepMs);
+}
+
+function formatSlotLabel(
+    date: Date,
+    business: BusinessRecord | null,
+    spanish: boolean,
+    includeDate = true
+) {
+    const timeZone = getBusinessTimezone(business);
+
+    return new Intl.DateTimeFormat(spanish ? "es-US" : "en-US", {
+        timeZone,
+        weekday: includeDate ? "short" : undefined,
+        month: includeDate ? "short" : undefined,
+        day: includeDate ? "numeric" : undefined,
+        hour: "numeric",
+        minute: "2-digit",
+    }).format(date);
+}
+
+function isSpanishMessage(message: string) {
+    return /\b(hola|quiero|necesito|cita|agendar|reservar|disponible|disponibilidad|mañana|manana|gracias|sí|si|hoy|cambiar|cambio)\b/i.test(
+        message
+    );
 }
 
 function isSlotInsideBusinessHours(input: {
@@ -301,79 +402,14 @@ function isSlotInsideBusinessHours(input: {
         closeUtc = addMinutes(closeUtc, 24 * 60);
     }
 
+    const inside =
+        start.getTime() >= openUtc.getTime() &&
+        end.getTime() <= closeUtc.getTime();
+
     return {
-        inside:
-            start.getTime() >= openUtc.getTime() &&
-            end.getTime() <= closeUtc.getTime(),
-        reason:
-            start.getTime() >= openUtc.getTime() &&
-                end.getTime() <= closeUtc.getTime()
-                ? null
-                : "outside_business_hours",
+        inside,
+        reason: inside ? null : "outside_business_hours",
     };
-}
-
-function normalizeText(value: unknown) {
-    return String(value || "")
-        .toLowerCase()
-        .replace(/[^\w\s+]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function getServiceDurationMinutes(
-    business: BusinessRecord | null,
-    serviceName: unknown,
-    fallback = DEFAULT_BOOKING_DURATION_MINUTES
-) {
-    const settings = getBusinessSettings(business);
-    const services = Array.isArray(settings.services) ? settings.services : [];
-    const normalizedServiceName = normalizeText(serviceName);
-
-    const matchedService = services.find((service: Record<string, any>) => {
-        const serviceTitle = normalizeText(service.name || service.title);
-
-        if (!serviceTitle || !normalizedServiceName) return false;
-
-        return (
-            serviceTitle === normalizedServiceName ||
-            normalizedServiceName.includes(serviceTitle) ||
-            serviceTitle.includes(normalizedServiceName)
-        );
-    });
-
-    const duration = Number(
-        matchedService?.durationMinutes ||
-        matchedService?.duration_minutes ||
-        matchedService?.duration
-    );
-
-    return Number.isFinite(duration) && duration > 0 ? duration : fallback;
-}
-
-function roundUpToStep(date: Date, stepMinutes: number) {
-    const stepMs = stepMinutes * 60 * 1000;
-
-    return new Date(Math.ceil(date.getTime() / stepMs) * stepMs);
-}
-
-function formatSlotLabel(date: Date, business: BusinessRecord | null, spanish: boolean) {
-    const timeZone = getBusinessTimezone(business);
-
-    return new Intl.DateTimeFormat(spanish ? "es-US" : "en-US", {
-        timeZone,
-        weekday: "short",
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-    }).format(date);
-}
-
-function isSpanishMessage(message: string) {
-    return /\b(hola|quiero|necesito|cita|agendar|reservar|disponible|mañana|manana|gracias|sí|si)\b/i.test(
-        message
-    );
 }
 
 async function getBusinessForBookingAutomation(businessId: string) {
@@ -399,7 +435,7 @@ async function getConversationHistory(
         .select("sender_type, content, created_at, metadata")
         .eq("conversation_id", conversationId)
         .order("created_at", { ascending: true })
-        .limit(40);
+        .limit(50);
 
     if (error) {
         console.error("Get booking history error:", error);
@@ -407,6 +443,29 @@ async function getConversationHistory(
     }
 
     return data || [];
+}
+
+async function getContactProfileForBooking(contactId: string | null) {
+    if (!contactId) return null;
+
+    const { data, error } = await supabase
+        .from("contacts")
+        .select("full_name, email, phone")
+        .eq("id", contactId)
+        .maybeSingle();
+
+    if (error) {
+        console.error("Get contact profile for booking error:", error);
+        return null;
+    }
+
+    if (!data) return null;
+
+    return {
+        fullName: data.full_name || null,
+        email: data.email || null,
+        phone: data.phone || null,
+    };
 }
 
 async function updateOrCreateBookingContact(input: {
@@ -512,6 +571,7 @@ async function isBookingSlotAvailable(input: {
     business: BusinessRecord | null;
     scheduledAt: string;
     durationMinutes?: number | null;
+    excludeBookingId?: string | null;
 }) {
     const start = new Date(input.scheduledAt);
 
@@ -540,15 +600,21 @@ async function isBookingSlotAvailable(input: {
         };
     }
 
-    const searchStart = addMinutes(start, -12 * 60);
+    const searchStart = addMinutes(start, -24 * 60);
 
-    const { data, error } = await supabase
+    let query: any = supabase
         .from("bookings")
         .select("id, scheduled_at, status, service_name")
         .eq("business_id", input.businessId)
         .in("status", ["pending", "confirmed"])
         .gte("scheduled_at", searchStart.toISOString())
         .lt("scheduled_at", end.toISOString());
+
+    if (input.excludeBookingId) {
+        query = query.neq("id", input.excludeBookingId);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
         console.error("Check booking availability error:", error);
@@ -572,7 +638,10 @@ async function isBookingSlotAvailable(input: {
 
         const existingEnd = addMinutes(existingStart, existingDuration);
 
-        return existingStart.getTime() < end.getTime() && existingEnd.getTime() > start.getTime();
+        return (
+            existingStart.getTime() < end.getTime() &&
+            existingEnd.getTime() > start.getTime()
+        );
     });
 
     return {
@@ -580,6 +649,30 @@ async function isBookingSlotAvailable(input: {
         reason: conflictingBooking ? "slot_taken" : null,
         conflictingBookingId: conflictingBooking?.id || null,
     };
+}
+
+async function getExistingActiveBooking(input: {
+    businessId: string;
+    conversationId: string;
+}): Promise<ExistingBookingRecord | null> {
+    const { data, error } = await supabase
+        .from("bookings")
+        .select(
+            "id, business_id, contact_id, conversation_id, customer_name, service_name, scheduled_at, status, estimated_value, notes"
+        )
+        .eq("business_id", input.businessId)
+        .eq("conversation_id", input.conversationId)
+        .in("status", ["pending", "confirmed"])
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+    if (error) {
+        console.error("Find existing active booking error:", error);
+        return null;
+    }
+
+    return data || null;
 }
 
 function getBookingAutomationMetadata(item: ConversationHistoryItem) {
@@ -599,7 +692,18 @@ function getBookingAutomationMetadata(item: ConversationHistoryItem) {
     return bookingAutomation as Record<string, any>;
 }
 
-function getLastBookingContext(history: ConversationHistoryItem[]): LastBookingContext {
+function getLastBookingContext(
+    history: ConversationHistoryItem[],
+    existingBooking?: ExistingBookingRecord | null
+): LastBookingContext {
+    if (existingBooking) {
+        return {
+            serviceName: existingBooking.service_name || null,
+            scheduledAt: existingBooking.scheduled_at || null,
+            durationMinutes: null,
+        };
+    }
+
     for (let index = history.length - 1; index >= 0; index--) {
         const automation = getBookingAutomationMetadata(history[index]);
 
@@ -655,7 +759,9 @@ function getLastSuggestedSlots(
 
         const suggestedSlots =
             automation?.suggestedSlots ||
-            automation?.suggested_slots;
+            automation?.suggested_slots ||
+            automation?.availableSlots ||
+            automation?.available_slots;
 
         if (Array.isArray(suggestedSlots) && suggestedSlots.length) {
             return suggestedSlots
@@ -674,7 +780,7 @@ function getLastSuggestedSlots(
     return [];
 }
 
-function extractTimeChoiceFromMessage(message: string) {
+function extractTimeChoiceFromMessage(message: string): TimeChoice | null {
     const match = String(message).match(
         /(?:^|\s)(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\b|\?)/i
     );
@@ -703,11 +809,7 @@ function getHour12(hour24: number) {
 
 function doesSlotMatchTimeChoice(
     scheduledAt: string,
-    choice: {
-        hour: number;
-        minute: number;
-        period: "am" | "pm" | null;
-    },
+    choice: TimeChoice,
     business: BusinessRecord | null
 ) {
     const date = new Date(scheduledAt);
@@ -780,6 +882,37 @@ function isStrongBookingConfirmation(message: string) {
         text.includes("resérvalo") ||
         text.includes("me sirve")
     );
+}
+
+function isBookingChangeRequest(message: string) {
+    const text = normalizeText(message);
+
+    return (
+        text.includes("change") ||
+        text.includes("reschedule") ||
+        text.includes("move") ||
+        text.includes("different time") ||
+        text.includes("another time") ||
+        text.includes("change the hour") ||
+        text.includes("change hour") ||
+        text.includes("modify") ||
+        text.includes("update the time") ||
+        text.includes("cambiar") ||
+        text.includes("cambio") ||
+        text.includes("reagendar") ||
+        text.includes("mover") ||
+        text.includes("modificar") ||
+        text.includes("otra hora") ||
+        text.includes("otro horario")
+    );
+}
+
+function hasRecentBookingChangeRequest(history: ConversationHistoryItem[]) {
+    const lastContactMessages = history
+        .filter((item) => item.sender_type === "contact")
+        .slice(-4);
+
+    return lastContactMessages.some((item) => isBookingChangeRequest(item.content));
 }
 
 function isAvailabilityLookupMessage(input: {
@@ -913,10 +1046,18 @@ function getWindowBounds(input: {
         timeZone
     );
 
-    if (!dayHours || !dayHours.enabled) return null;
+    let openUtc: Date | null = null;
+    let closeUtc: Date | null = null;
 
-    const openUtc = zonedTimeToUtc(input.dateKey, dayHours.open, timeZone);
-    let closeUtc = zonedTimeToUtc(input.dateKey, dayHours.close, timeZone);
+    if (!dayHours) {
+        openUtc = zonedTimeToUtc(input.dateKey, "9:00 am", timeZone);
+        closeUtc = zonedTimeToUtc(input.dateKey, "5:00 pm", timeZone);
+    } else if (!dayHours.enabled) {
+        return null;
+    } else {
+        openUtc = zonedTimeToUtc(input.dateKey, dayHours.open, timeZone);
+        closeUtc = zonedTimeToUtc(input.dateKey, dayHours.close, timeZone);
+    }
 
     if (!openUtc || !closeUtc) return null;
 
@@ -955,8 +1096,10 @@ async function findAvailableSlotsForWindow(input: {
     window: string;
     durationMinutes: number;
     limit?: number;
+    excludeBookingId?: string | null;
+    excludeScheduledAt?: string | null;
 }) {
-    const limit = input.limit || 5;
+    const limit = input.limit || MAX_AVAILABILITY_LOOKUP_SLOTS;
     const timeZone = getBusinessTimezone(input.business);
     const todayKey = getDateKeyInTimeZone(new Date(), timeZone);
     const minimumNoticeMinutes = getMinimumNoticeMinutes(input.business);
@@ -986,23 +1129,275 @@ async function findAvailableSlotsForWindow(input: {
         bounds.end.getTime() &&
         availableSlots.length < limit
     ) {
-        const availability = await isBookingSlotAvailable({
-            businessId: input.businessId,
-            business: input.business,
-            scheduledAt: candidate.toISOString(),
-            durationMinutes: input.durationMinutes,
-        });
+        const candidateIso = candidate.toISOString();
 
-        if (availability.available) {
-            availableSlots.push({
-                scheduledAt: candidate.toISOString(),
+        const sameAsExcluded =
+            input.excludeScheduledAt &&
+            isSameScheduledMinute(candidateIso, input.excludeScheduledAt);
+
+        if (!sameAsExcluded) {
+            const availability = await isBookingSlotAvailable({
+                businessId: input.businessId,
+                business: input.business,
+                scheduledAt: candidateIso,
+                durationMinutes: input.durationMinutes,
+                excludeBookingId: input.excludeBookingId,
             });
+
+            if (availability.available) {
+                availableSlots.push({
+                    scheduledAt: candidateIso,
+                });
+            }
         }
 
         candidate = addMinutes(candidate, SLOT_STEP_MINUTES);
     }
 
     return availableSlots;
+}
+
+async function findAvailableBookingSlots(input: {
+    businessId: string;
+    business: BusinessRecord | null;
+    requestedScheduledAt: string;
+    durationMinutes?: number | null;
+    limit?: number;
+    excludeBookingId?: string | null;
+}) {
+    const requestedDate = new Date(input.requestedScheduledAt);
+
+    if (Number.isNaN(requestedDate.getTime())) return [];
+
+    const business = input.business;
+    const timeZone = getBusinessTimezone(business);
+    const businessHours = getBusinessHours(business);
+    const durationMinutes =
+        input.durationMinutes || DEFAULT_BOOKING_DURATION_MINUTES;
+
+    const limit = input.limit || MAX_SUGGESTED_SLOTS;
+    const minimumNoticeMinutes = getMinimumNoticeMinutes(business);
+    const earliestAllowed = addMinutes(new Date(), minimumNoticeMinutes);
+    const requestedPlusStep = addMinutes(requestedDate, SLOT_STEP_MINUTES);
+
+    const suggestedSlots: SuggestedBookingSlot[] = [];
+
+    if (!businessHours.length) {
+        let candidate = roundUpToStep(
+            new Date(
+                Math.max(requestedPlusStep.getTime(), earliestAllowed.getTime())
+            ),
+            SLOT_STEP_MINUTES
+        );
+
+        for (
+            let attempt = 0;
+            attempt < 96 && suggestedSlots.length < limit;
+            attempt++
+        ) {
+            const availability = await isBookingSlotAvailable({
+                businessId: input.businessId,
+                business,
+                scheduledAt: candidate.toISOString(),
+                durationMinutes,
+                excludeBookingId: input.excludeBookingId,
+            });
+
+            if (availability.available) {
+                suggestedSlots.push({
+                    scheduledAt: candidate.toISOString(),
+                });
+            }
+
+            candidate = addMinutes(candidate, SLOT_STEP_MINUTES);
+        }
+
+        return suggestedSlots;
+    }
+
+    const baseDateKey = getDateKeyInTimeZone(requestedDate, timeZone);
+
+    for (
+        let dayOffset = 0;
+        dayOffset < 10 && suggestedSlots.length < limit;
+        dayOffset++
+    ) {
+        const dateKey = addDaysToDateKey(baseDateKey, dayOffset);
+        const dayHours = getBusinessHoursForDateKey(business, dateKey, timeZone);
+
+        if (!dayHours || !dayHours.enabled) continue;
+
+        const openUtc = zonedTimeToUtc(dateKey, dayHours.open, timeZone);
+        let closeUtc = zonedTimeToUtc(dateKey, dayHours.close, timeZone);
+
+        if (!openUtc || !closeUtc) continue;
+
+        if (closeUtc.getTime() <= openUtc.getTime()) {
+            closeUtc = addMinutes(closeUtc, 24 * 60);
+        }
+
+        const earliestCandidate =
+            dayOffset === 0
+                ? new Date(
+                    Math.max(
+                        openUtc.getTime(),
+                        requestedPlusStep.getTime(),
+                        earliestAllowed.getTime()
+                    )
+                )
+                : new Date(Math.max(openUtc.getTime(), earliestAllowed.getTime()));
+
+        let candidate = roundUpToStep(earliestCandidate, SLOT_STEP_MINUTES);
+
+        while (
+            addMinutes(candidate, durationMinutes).getTime() <= closeUtc.getTime() &&
+            suggestedSlots.length < limit
+        ) {
+            const availability = await isBookingSlotAvailable({
+                businessId: input.businessId,
+                business,
+                scheduledAt: candidate.toISOString(),
+                durationMinutes,
+                excludeBookingId: input.excludeBookingId,
+            });
+
+            if (
+                availability.available &&
+                candidate.getTime() !== requestedDate.getTime()
+            ) {
+                suggestedSlots.push({
+                    scheduledAt: candidate.toISOString(),
+                });
+            }
+
+            candidate = addMinutes(candidate, SLOT_STEP_MINUTES);
+        }
+    }
+
+    return suggestedSlots;
+}
+
+function isSameScheduledMinute(first: string, second: string) {
+    const firstDate = new Date(first);
+    const secondDate = new Date(second);
+
+    if (Number.isNaN(firstDate.getTime()) || Number.isNaN(secondDate.getTime())) {
+        return false;
+    }
+
+    return Math.abs(firstDate.getTime() - secondDate.getTime()) < 60 * 1000;
+}
+
+function buildDateTimeFromTimeChoice(input: {
+    dateKey: string;
+    choice: TimeChoice;
+    business: BusinessRecord | null;
+}) {
+    const timeZone = getBusinessTimezone(input.business);
+    const period =
+        input.choice.period ||
+        (input.choice.hour >= 7 && input.choice.hour <= 11 ? "am" : "pm");
+
+    return zonedTimeToUtc(
+        input.dateKey,
+        `${input.choice.hour}:${String(input.choice.minute).padStart(
+            2,
+            "0"
+        )} ${period}`,
+        timeZone
+    );
+}
+
+function resolveRequestedScheduledAtFromMessage(input: {
+    message: string;
+    history: ConversationHistoryItem[];
+    business: BusinessRecord | null;
+    existingBooking?: ExistingBookingRecord | null;
+    selectedSuggestedSlot?: SuggestedBookingSlot | null;
+    extractedScheduledAt?: string | null;
+}) {
+    if (input.selectedSuggestedSlot?.scheduledAt) {
+        return input.selectedSuggestedSlot.scheduledAt;
+    }
+
+    const choice = extractTimeChoiceFromMessage(input.message);
+
+    if (!choice) {
+        if (input.extractedScheduledAt) {
+            return input.extractedScheduledAt;
+        }
+
+        return null;
+    }
+
+    const fallbackScheduledAt =
+        input.existingBooking?.scheduled_at || input.extractedScheduledAt || null;
+
+    const dateKey = resolveAvailabilityDateKey({
+        message: input.message,
+        history: input.history,
+        business: input.business,
+        fallbackScheduledAt,
+    });
+
+    const date = buildDateTimeFromTimeChoice({
+        dateKey,
+        choice,
+        business: input.business,
+    });
+
+    return date?.toISOString() || null;
+}
+
+function buildSlotUnavailableReply(input: {
+    message: string;
+    business: BusinessRecord | null;
+    requestedScheduledAt: string;
+    suggestedSlots: SuggestedBookingSlot[];
+    reason?: string | null;
+}) {
+    const spanish = isSpanishMessage(input.message);
+    const requestedDate = new Date(input.requestedScheduledAt);
+    const requestedLabel = Number.isNaN(requestedDate.getTime())
+        ? null
+        : formatSlotLabel(requestedDate, input.business, spanish);
+
+    const suggestions = input.suggestedSlots
+        .map((slot) =>
+            formatSlotLabel(new Date(slot.scheduledAt), input.business, spanish)
+        )
+        .filter(Boolean);
+
+    const outsideHours = input.reason === "outside_business_hours";
+
+    if (spanish) {
+        const reasonText = outsideHours
+            ? "Ese horario está fuera del horario del negocio"
+            : "Ese horario ya no está disponible";
+
+        if (!suggestions.length) {
+            return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""
+                }. No encontré otro horario disponible dentro del horario del negocio por ahora. ¿Qué otro día u hora te funciona?`;
+        }
+
+        return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""
+            }. Tengo estos horarios disponibles:\n\n${suggestions
+                .map((slot) => `- ${slot}`)
+                .join("\n")}\n\n¿Cuál prefieres?`;
+    }
+
+    const reasonText = outsideHours
+        ? "That time is outside business hours"
+        : "That time is no longer available";
+
+    if (!suggestions.length) {
+        return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""
+            }. I could not find another available time within business hours right now. What other day or time works for you?`;
+    }
+
+    return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""}. These times are available:\n\n${suggestions
+        .map((slot) => `- ${slot}`)
+        .join("\n")}\n\nWhich one would you prefer?`;
 }
 
 function buildAvailabilityLookupReply(input: {
@@ -1045,7 +1440,7 @@ function buildAvailabilityLookupReply(input: {
                     : "";
 
     const slots = input.availableSlots.map((slot) =>
-        formatSlotLabel(new Date(slot.scheduledAt), input.business, spanish)
+        formatSlotLabel(new Date(slot.scheduledAt), input.business, spanish, false)
     );
 
     if (spanish) {
@@ -1067,23 +1462,368 @@ function buildAvailabilityLookupReply(input: {
         }:\n\n${slots.map((slot) => `- ${slot}`).join("\n")}\n\nWhich one would you prefer?`;
 }
 
-async function bookingAlreadyExists(input: {
-    businessId: string;
-    conversationId: string;
+function buildBookingCreatedReply(input: {
+    message: string;
+    business: BusinessRecord | null;
+    serviceName: string;
+    scheduledAt: string;
 }) {
+    const spanish = isSpanishMessage(input.message);
+    const scheduledDate = new Date(input.scheduledAt);
+    const scheduledLabel = formatSlotLabel(scheduledDate, input.business, spanish);
+
+    if (spanish) {
+        return `Listo, guardé tu solicitud para ${input.serviceName} el ${scheduledLabel}. Está pendiente de confirmación del equipo.`;
+    }
+
+    return `Done, I saved your request for ${input.serviceName} on ${scheduledLabel}. It is pending team confirmation.`;
+}
+
+function buildBookingUpdatedReply(input: {
+    message: string;
+    business: BusinessRecord | null;
+    serviceName: string;
+    scheduledAt: string;
+}) {
+    const spanish = isSpanishMessage(input.message);
+    const scheduledDate = new Date(input.scheduledAt);
+    const scheduledLabel = formatSlotLabel(scheduledDate, input.business, spanish);
+
+    if (spanish) {
+        return `Listo, actualicé tu reserva para ${input.serviceName} al ${scheduledLabel}. Sigue pendiente de confirmación del equipo.`;
+    }
+
+    return `Done, I updated your booking for ${input.serviceName} to ${scheduledLabel}. It is still pending team confirmation.`;
+}
+
+function buildRescheduleOptionsReply(input: {
+    message: string;
+    business: BusinessRecord | null;
+    serviceName: string;
+    availableSlots: SuggestedBookingSlot[];
+}) {
+    const spanish = isSpanishMessage(input.message);
+
+    const slots = input.availableSlots.map((slot) =>
+        formatSlotLabel(new Date(slot.scheduledAt), input.business, spanish)
+    );
+
+    if (spanish) {
+        if (!slots.length) {
+            return `Claro, puedo ayudarte a cambiar la hora de ${input.serviceName}, pero no encontré otros horarios disponibles dentro del horario del negocio. ¿Qué otra hora o día te sirve?`;
+        }
+
+        return `Claro, puedo ayudarte a cambiar la hora de ${input.serviceName}. Estos horarios están disponibles:\n\n${slots
+            .map((slot) => `- ${slot}`)
+            .join("\n")}\n\n¿Cuál prefieres?`;
+    }
+
+    if (!slots.length) {
+        return `Sure, I can help change the time for your ${input.serviceName} booking, but I could not find other available times within business hours. What other day or time works for you?`;
+    }
+
+    return `Sure, I can help change the time for your ${input.serviceName} booking. These times are available:\n\n${slots
+        .map((slot) => `- ${slot}`)
+        .join("\n")}\n\nWhich one would you prefer?`;
+}
+
+function normalizeExtractedBookingDetails(value: any): ExtractedBookingDetails {
+    return {
+        isBookingIntent: Boolean(value?.isBookingIntent),
+        isConfirmed: Boolean(value?.isConfirmed),
+        customerName: value?.customerName || null,
+        email: value?.email || null,
+        phone: value?.phone || null,
+        serviceName: value?.serviceName || null,
+        scheduledAt: value?.scheduledAt || null,
+        estimatedValue:
+            Number.isFinite(Number(value?.estimatedValue)) &&
+                Number(value?.estimatedValue) > 0
+                ? Number(value.estimatedValue)
+                : null,
+        durationMinutes:
+            Number.isFinite(Number(value?.durationMinutes)) &&
+                Number(value?.durationMinutes) > 0
+                ? Number(value.durationMinutes)
+                : null,
+        notes: value?.notes || null,
+        missingFields: Array.isArray(value?.missingFields)
+            ? value.missingFields
+            : [],
+    };
+}
+
+function applyBookingContext(input: {
+    extracted: ExtractedBookingDetails;
+    lastBookingContext: LastBookingContext;
+    selectedSuggestedSlot: SuggestedBookingSlot | null;
+}) {
+    const extracted = {
+        ...input.extracted,
+    };
+
+    if (!extracted.serviceName && input.lastBookingContext.serviceName) {
+        extracted.serviceName = input.lastBookingContext.serviceName;
+    }
+
+    if (!extracted.scheduledAt && input.lastBookingContext.scheduledAt) {
+        extracted.scheduledAt = input.lastBookingContext.scheduledAt;
+    }
+
+    if (!extracted.durationMinutes && input.lastBookingContext.durationMinutes) {
+        extracted.durationMinutes = input.lastBookingContext.durationMinutes;
+    }
+
+    if (input.selectedSuggestedSlot?.scheduledAt) {
+        extracted.scheduledAt = input.selectedSuggestedSlot.scheduledAt;
+        extracted.isConfirmed = true;
+
+        extracted.missingFields = (extracted.missingFields || []).filter(
+            (field) => field !== "scheduledAt" && field !== "confirmation"
+        );
+    }
+
+    return extracted;
+}
+
+async function getContactFallbackName(contactId: string | null) {
+    if (!contactId) return null;
+
     const { data, error } = await supabase
-        .from("bookings")
-        .select("id")
-        .eq("business_id", input.businessId)
-        .eq("conversation_id", input.conversationId)
-        .in("status", ["pending", "confirmed"])
+        .from("contacts")
+        .select("full_name, email, phone")
+        .eq("id", contactId)
         .maybeSingle();
 
     if (error) {
-        console.error("Find existing booking error:", error);
+        console.error("Get contact fallback name error:", error);
+        return null;
     }
 
-    return data?.id || null;
+    return data?.full_name || data?.email || data?.phone || null;
+}
+
+async function handleBookingReschedule(input: {
+    businessId: string;
+    conversationId: string;
+    contactId: string | null;
+    message: string;
+    analysisSummary?: string;
+    business: BusinessRecord | null;
+    history: ConversationHistoryItem[];
+    existingBooking: ExistingBookingRecord;
+    extracted: ExtractedBookingDetails;
+    selectedSuggestedSlot: SuggestedBookingSlot | null;
+    durationMinutes: number;
+}) {
+    const serviceName =
+        input.extracted.serviceName ||
+        input.existingBooking.service_name ||
+        "your service";
+
+    const requestedScheduledAt = resolveRequestedScheduledAtFromMessage({
+        message: input.message,
+        history: input.history,
+        business: input.business,
+        existingBooking: input.existingBooking,
+        selectedSuggestedSlot: input.selectedSuggestedSlot,
+        extractedScheduledAt: input.extracted.scheduledAt,
+    });
+
+    if (!requestedScheduledAt) {
+        const fallbackDate =
+            input.existingBooking.scheduled_at || new Date().toISOString();
+
+        const dateKey = getDateKeyInTimeZone(
+            new Date(fallbackDate),
+            getBusinessTimezone(input.business)
+        );
+
+        const availableSlots = await findAvailableSlotsForWindow({
+            businessId: input.businessId,
+            business: input.business,
+            dateKey,
+            window: "all_day",
+            durationMinutes: input.durationMinutes,
+            limit: MAX_SUGGESTED_SLOTS,
+            excludeBookingId: input.existingBooking.id,
+            excludeScheduledAt: input.existingBooking.scheduled_at,
+        });
+
+        const replyOverride = buildRescheduleOptionsReply({
+            message: input.message,
+            business: input.business,
+            serviceName,
+            availableSlots,
+        });
+
+        await supabase.from("ai_activity_logs").insert({
+            business_id: input.businessId,
+            conversation_id: input.conversationId,
+            contact_id: input.contactId,
+            type: "workflow_triggered",
+            status: "success",
+            title: "Booking reschedule options suggested",
+            description:
+                "Customer asked to change an existing booking. AI suggested available times.",
+            metadata: {
+                source: "booking_automation",
+                existingBookingId: input.existingBooking.id,
+                suggestedSlots: availableSlots,
+                extracted: input.extracted,
+            },
+        });
+
+        return {
+            created: false,
+            updated: false,
+            reason: "reschedule_options_suggested",
+            bookingId: input.existingBooking.id,
+            contactId: input.contactId,
+            suggestedSlots: availableSlots,
+            extracted: input.extracted,
+            replyOverride,
+        };
+    }
+
+    const availability = await isBookingSlotAvailable({
+        businessId: input.businessId,
+        business: input.business,
+        scheduledAt: requestedScheduledAt,
+        durationMinutes: input.durationMinutes,
+        excludeBookingId: input.existingBooking.id,
+    });
+
+    if (!availability.available) {
+        const suggestedSlots = await findAvailableBookingSlots({
+            businessId: input.businessId,
+            business: input.business,
+            requestedScheduledAt,
+            durationMinutes: input.durationMinutes,
+            limit: MAX_SUGGESTED_SLOTS,
+            excludeBookingId: input.existingBooking.id,
+        });
+
+        const replyOverride = buildSlotUnavailableReply({
+            message: input.message,
+            business: input.business,
+            requestedScheduledAt,
+            suggestedSlots,
+            reason: availability.reason,
+        });
+
+        await supabase.from("ai_activity_logs").insert({
+            business_id: input.businessId,
+            conversation_id: input.conversationId,
+            contact_id: input.contactId,
+            type: "workflow_triggered",
+            status: "warning",
+            title: "Booking reschedule slot unavailable",
+            description:
+                "Customer requested to reschedule, but the selected time is unavailable.",
+            metadata: {
+                source: "booking_automation",
+                existingBookingId: input.existingBooking.id,
+                requestedScheduledAt,
+                suggestedSlots,
+                availability,
+                extracted: input.extracted,
+            },
+        });
+
+        return {
+            created: false,
+            updated: false,
+            reason: availability.reason || "reschedule_slot_unavailable",
+            bookingId: input.existingBooking.id,
+            contactId: input.contactId,
+            suggestedSlots,
+            extracted: {
+                ...input.extracted,
+                scheduledAt: requestedScheduledAt,
+            },
+            replyOverride,
+        };
+    }
+
+    const updatedNotes = [
+        input.existingBooking.notes,
+        `Rescheduled by AI from ${input.existingBooking.scheduled_at} to ${requestedScheduledAt}.`,
+        input.analysisSummary,
+    ]
+        .filter(Boolean)
+        .join("\n");
+
+    const { data: updatedBooking, error: updateError } = await supabase
+        .from("bookings")
+        .update({
+            service_name: serviceName,
+            scheduled_at: requestedScheduledAt,
+            status: "pending" satisfies BookingStatus,
+            estimated_value:
+                input.extracted.estimatedValue ??
+                input.existingBooking.estimated_value ??
+                0,
+            notes: updatedNotes || null,
+        })
+        .eq("id", input.existingBooking.id)
+        .eq("business_id", input.businessId)
+        .select("*")
+        .single();
+
+    if (updateError || !updatedBooking) {
+        console.error("Update automated booking error:", updateError);
+
+        return {
+            created: false,
+            updated: false,
+            reason: "booking_update_failed",
+            error: updateError?.message,
+            bookingId: input.existingBooking.id,
+            contactId: input.contactId,
+            extracted: input.extracted,
+        };
+    }
+
+    await supabase.from("ai_activity_logs").insert({
+        business_id: input.businessId,
+        conversation_id: input.conversationId,
+        contact_id: input.contactId,
+        type: "appointment_scheduled",
+        status: "success",
+        title: "Booking rescheduled by AI",
+        description: `Booking updated to ${requestedScheduledAt}.`,
+        metadata: {
+            source: "booking_automation",
+            bookingId: updatedBooking.id,
+            previousScheduledAt: input.existingBooking.scheduled_at,
+            newScheduledAt: requestedScheduledAt,
+            extracted: {
+                ...input.extracted,
+                scheduledAt: requestedScheduledAt,
+            },
+            booking: updatedBooking,
+        },
+    });
+
+    return {
+        created: false,
+        updated: true,
+        reason: "booking_rescheduled",
+        booking: updatedBooking,
+        bookingId: updatedBooking.id,
+        contactId: input.contactId,
+        extracted: {
+            ...input.extracted,
+            scheduledAt: requestedScheduledAt,
+        },
+        replyOverride: buildBookingUpdatedReply({
+            message: input.message,
+            business: input.business,
+            serviceName,
+            scheduledAt: requestedScheduledAt,
+        }),
+    };
 }
 
 export async function processBookingAutomation(input: BookingAutomationInput) {
@@ -1091,9 +1831,13 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
 
     const business = await getBusinessForBookingAutomation(input.businessId);
     const history = await getConversationHistory(input.conversationId);
-    const contactProfile = await getContactProfile(input.contactId);
+    const contactProfile = await getContactProfileForBooking(input.contactId);
+    const existingBooking = await getExistingActiveBooking({
+        businessId: input.businessId,
+        conversationId: input.conversationId,
+    });
 
-    const lastBookingContext = getLastBookingContext(history);
+    const lastBookingContext = getLastBookingContext(history, existingBooking);
 
     const selectedSuggestedSlot = resolveSuggestedSlotSelection({
         message: input.message,
@@ -1107,6 +1851,12 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         lastBookingContext.durationMinutes
     );
 
+    const changeRequest =
+        Boolean(existingBooking) &&
+        (isBookingChangeRequest(input.message) ||
+            hasRecentBookingChangeRequest(history) ||
+            Boolean(selectedSuggestedSlot));
+
     const availabilityLookup = isAvailabilityLookupMessage({
         message: input.message,
         hasLastBookingContext,
@@ -1118,6 +1868,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         input.analysis.intent === "booking_ready" ||
         Boolean(selectedSuggestedSlot) ||
         availabilityLookup ||
+        changeRequest ||
         lowerMessage.includes("book") ||
         lowerMessage.includes("booking") ||
         lowerMessage.includes("appointment") ||
@@ -1145,20 +1896,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         };
     }
 
-    const existingBookingId = await bookingAlreadyExists({
-        businessId: input.businessId,
-        conversationId: input.conversationId,
-    });
-
-    if (existingBookingId) {
-        return {
-            created: false,
-            reason: "booking_already_exists",
-            bookingId: existingBookingId,
-        };
-    }
-
-    const extracted = await extractBookingDetailsWithAI({
+    const aiExtracted = await extractBookingDetailsWithAI({
         business,
         currentDateIso: new Date().toISOString(),
         customerProfile: contactProfile,
@@ -1168,24 +1906,18 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         })),
     });
 
-    if (selectedSuggestedSlot?.scheduledAt) {
-        extracted.scheduledAt = selectedSuggestedSlot.scheduledAt;
-        extracted.isConfirmed = true;
+    const extracted = applyBookingContext({
+        extracted: normalizeExtractedBookingDetails(aiExtracted),
+        lastBookingContext,
+        selectedSuggestedSlot,
+    });
 
-        extracted.missingFields = (extracted.missingFields || []).filter(
-            (field) => field !== "scheduledAt" && field !== "confirmation"
-        );
-    }
-
-    if (!extracted.serviceName && lastBookingContext.serviceName) {
-        extracted.serviceName = lastBookingContext.serviceName;
-    }
-
-    if (!extracted.durationMinutes && lastBookingContext.durationMinutes) {
-        extracted.durationMinutes = lastBookingContext.durationMinutes;
-    }
-
-    if (!extracted.isBookingIntent && !selectedSuggestedSlot && !availabilityLookup) {
+    if (
+        !extracted.isBookingIntent &&
+        !selectedSuggestedSlot &&
+        !availabilityLookup &&
+        !changeRequest
+    ) {
         return {
             created: false,
             reason: "ai_not_booking_intent",
@@ -1195,7 +1927,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
 
     const updatedContactId = await updateOrCreateBookingContact({
         businessId: input.businessId,
-        currentContactId: input.contactId,
+        currentContactId: input.contactId || existingBooking?.contact_id || null,
         conversationId: input.conversationId,
         customerName: extracted.customerName,
         email: extracted.email,
@@ -1203,15 +1935,34 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
     });
 
     const fallbackCustomerName =
-        extracted.customerName || (await getContactFallbackName(updatedContactId));
+        extracted.customerName ||
+        existingBooking?.customer_name ||
+        (await getContactFallbackName(updatedContactId));
 
     const bookingDurationMinutes =
         extracted.durationMinutes ||
+        lastBookingContext.durationMinutes ||
         getServiceDurationMinutes(
             business,
             extracted.serviceName || lastBookingContext.serviceName,
             DEFAULT_BOOKING_DURATION_MINUTES
         );
+
+    if (existingBooking && changeRequest) {
+        return handleBookingReschedule({
+            businessId: input.businessId,
+            conversationId: input.conversationId,
+            contactId: updatedContactId,
+            message: input.message,
+            analysisSummary: input.analysis.aiSummary,
+            business,
+            history,
+            existingBooking,
+            extracted,
+            selectedSuggestedSlot,
+            durationMinutes: bookingDurationMinutes,
+        });
+    }
 
     if (availabilityLookup && !selectedSuggestedSlot) {
         const serviceName = extracted.serviceName || lastBookingContext.serviceName;
@@ -1232,7 +1983,8 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
             message: input.message,
             history,
             business,
-            fallbackScheduledAt: extracted.scheduledAt || lastBookingContext.scheduledAt,
+            fallbackScheduledAt:
+                extracted.scheduledAt || lastBookingContext.scheduledAt,
         });
 
         const window = resolveAvailabilityWindow(input.message);
@@ -1243,7 +1995,9 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
             dateKey,
             window,
             durationMinutes: bookingDurationMinutes,
-            limit: 5,
+            limit: MAX_AVAILABILITY_LOOKUP_SLOTS,
+            excludeBookingId: existingBooking?.id || null,
+            excludeScheduledAt: existingBooking?.scheduled_at || null,
         });
 
         const replyOverride = buildAvailabilityLookupReply({
@@ -1262,7 +2016,8 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
             type: "workflow_triggered",
             status: "success",
             title: "Booking availability checked",
-            description: "AI returned real available booking slots within business hours.",
+            description:
+                "AI returned real available booking slots within business hours.",
             metadata: {
                 source: "booking_automation",
                 dateKey,
@@ -1280,6 +2035,15 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
             contactId: updatedContactId,
             suggestedSlots: availableSlots,
             replyOverride,
+        };
+    }
+
+    if (existingBooking) {
+        return {
+            created: false,
+            reason: "booking_already_exists",
+            bookingId: existingBooking.id,
+            contactId: updatedContactId,
         };
     }
 
@@ -1363,178 +2127,6 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         };
     }
 
-    async function findAvailableBookingSlots(input: {
-        businessId: string;
-        business: BusinessRecord | null;
-        requestedScheduledAt: string;
-        durationMinutes?: number | null;
-        limit?: number;
-    }): Promise<SuggestedBookingSlot[]> {
-        const requestedDate = new Date(input.requestedScheduledAt);
-
-        if (Number.isNaN(requestedDate.getTime())) return [];
-
-        const business = input.business;
-        const timeZone = getBusinessTimezone(business);
-        const businessHours = getBusinessHours(business);
-        const durationMinutes =
-            input.durationMinutes || DEFAULT_BOOKING_DURATION_MINUTES;
-
-        const limit = input.limit || MAX_SUGGESTED_SLOTS;
-        const minimumNoticeMinutes = getMinimumNoticeMinutes(business);
-        const earliestAllowed = addMinutes(new Date(), minimumNoticeMinutes);
-        const requestedPlusStep = addMinutes(requestedDate, SLOT_STEP_MINUTES);
-
-        const suggestedSlots: SuggestedBookingSlot[] = [];
-
-        if (!businessHours.length) {
-            let candidate = roundUpToStep(
-                new Date(
-                    Math.max(requestedPlusStep.getTime(), earliestAllowed.getTime())
-                ),
-                SLOT_STEP_MINUTES
-            );
-
-            for (let attempt = 0; attempt < 48 && suggestedSlots.length < limit; attempt++) {
-                const availability = await isBookingSlotAvailable({
-                    businessId: input.businessId,
-                    business,
-                    scheduledAt: candidate.toISOString(),
-                    durationMinutes,
-                });
-
-                if (availability.available) {
-                    suggestedSlots.push({
-                        scheduledAt: candidate.toISOString(),
-                    });
-                }
-
-                candidate = addMinutes(candidate, SLOT_STEP_MINUTES);
-            }
-
-            return suggestedSlots;
-        }
-
-        const baseDateKey = getDateKeyInTimeZone(requestedDate, timeZone);
-
-        for (let dayOffset = 0; dayOffset < 10 && suggestedSlots.length < limit; dayOffset++) {
-            const dateKey = addDaysToDateKey(baseDateKey, dayOffset);
-            const dayHours = getBusinessHoursForDateKey(business, dateKey, timeZone);
-
-            if (!dayHours || !dayHours.enabled) continue;
-
-            const openUtc = zonedTimeToUtc(dateKey, dayHours.open, timeZone);
-            let closeUtc = zonedTimeToUtc(dateKey, dayHours.close, timeZone);
-
-            if (!openUtc || !closeUtc) continue;
-
-            if (closeUtc.getTime() <= openUtc.getTime()) {
-                closeUtc = addMinutes(closeUtc, 24 * 60);
-            }
-
-            const earliestCandidate =
-                dayOffset === 0
-                    ? new Date(
-                        Math.max(
-                            openUtc.getTime(),
-                            requestedPlusStep.getTime(),
-                            earliestAllowed.getTime()
-                        )
-                    )
-                    : new Date(Math.max(openUtc.getTime(), earliestAllowed.getTime()));
-
-            let candidate = roundUpToStep(earliestCandidate, SLOT_STEP_MINUTES);
-
-            while (
-                addMinutes(candidate, durationMinutes).getTime() <= closeUtc.getTime() &&
-                suggestedSlots.length < limit
-            ) {
-                const availability = await isBookingSlotAvailable({
-                    businessId: input.businessId,
-                    business,
-                    scheduledAt: candidate.toISOString(),
-                    durationMinutes,
-                });
-
-                if (
-                    availability.available &&
-                    candidate.getTime() !== requestedDate.getTime()
-                ) {
-                    suggestedSlots.push({
-                        scheduledAt: candidate.toISOString(),
-                    });
-                }
-
-                candidate = addMinutes(candidate, SLOT_STEP_MINUTES);
-            }
-        }
-
-        return suggestedSlots;
-    }
-
-    function buildSlotUnavailableReply(input: {
-        message: string;
-        business: BusinessRecord | null;
-        requestedScheduledAt: string;
-        suggestedSlots: SuggestedBookingSlot[];
-        reason?: string | null;
-    }) {
-        const spanish = isSpanishMessage(input.message);
-        const requestedDate = new Date(input.requestedScheduledAt);
-        const requestedLabel = Number.isNaN(requestedDate.getTime())
-            ? null
-            : formatSlotLabel(requestedDate, input.business, spanish);
-
-        const suggestions = input.suggestedSlots
-            .map((slot) => formatSlotLabel(new Date(slot.scheduledAt), input.business, spanish))
-            .filter(Boolean);
-
-        const outsideHours = input.reason === "outside_business_hours";
-
-        if (spanish) {
-            const reasonText = outsideHours
-                ? "Ese horario está fuera del horario del negocio"
-                : "Ese horario ya no está disponible";
-
-            if (!suggestions.length) {
-                return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""}. No encontré otro horario disponible dentro del horario del negocio por ahora. ¿Qué otro día u hora te funciona?`;
-            }
-
-            return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""}. Tengo estos horarios disponibles:\n\n${suggestions
-                .map((slot) => `- ${slot}`)
-                .join("\n")}\n\n¿Cuál prefieres?`;
-        }
-
-        const reasonText = outsideHours
-            ? "That time is outside business hours"
-            : "That time is no longer available";
-
-        if (!suggestions.length) {
-            return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""}. I could not find another available time within the business hours right now. What other day or time works for you?`;
-        }
-
-        return `${reasonText}${requestedLabel ? ` (${requestedLabel})` : ""}. These times are available:\n\n${suggestions
-            .map((slot) => `- ${slot}`)
-            .join("\n")}\n\nWhich one would you prefer?`;
-    }
-
-    function buildBookingCreatedReply(input: {
-        message: string;
-        business: BusinessRecord | null;
-        serviceName: string;
-        scheduledAt: string;
-    }) {
-        const spanish = isSpanishMessage(input.message);
-        const scheduledDate = new Date(input.scheduledAt);
-        const scheduledLabel = formatSlotLabel(scheduledDate, input.business, spanish);
-
-        if (spanish) {
-            return `Listo, guardé tu solicitud para ${input.serviceName} el ${scheduledLabel}. Está pendiente de confirmación del equipo.`;
-        }
-
-        return `Done, I saved your request for ${input.serviceName} on ${scheduledLabel}. It is pending team confirmation.`;
-    }
-
     const { data: booking, error: bookingError } = await supabase
         .from("bookings")
         .insert({
@@ -1582,6 +2174,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
 
     return {
         created: true,
+        updated: false,
         reason: "booking_created",
         booking,
         contactId: updatedContactId,
@@ -1592,21 +2185,4 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
             scheduledAt: extracted.scheduledAt,
         }),
     };
-}
-
-async function getContactFallbackName(contactId: string | null) {
-    if (!contactId) return null;
-
-    const { data, error } = await supabase
-        .from("contacts")
-        .select("full_name, email, phone")
-        .eq("id", contactId)
-        .maybeSingle();
-
-    if (error) {
-        console.error("Get contact fallback name error:", error);
-        return null;
-    }
-
-    return data?.full_name || data?.email || data?.phone || null;
 }
