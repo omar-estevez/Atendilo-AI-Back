@@ -48,6 +48,12 @@ type CustomerProfile = {
     phone: string | null;
 };
 
+type WebchatVisitor = {
+    name?: string;
+    email?: string;
+    phone?: string;
+};
+
 function getChannelConfig(config: unknown): ChannelConfig {
     if (!config || typeof config !== "object") {
         return {};
@@ -153,6 +159,53 @@ function getCurrentAiModel() {
     return "mock";
 }
 
+function buildVisitorProfile(input: {
+    visitor?: WebchatVisitor;
+    sessionVisitorName?: string | null;
+    sessionVisitorEmail?: string | null;
+    sessionVisitorPhone?: string | null;
+}): CustomerProfile | null {
+    const fullName =
+        input.visitor?.name?.trim() || input.sessionVisitorName?.trim() || null;
+
+    const email =
+        input.visitor?.email?.trim().toLowerCase() ||
+        input.sessionVisitorEmail?.trim().toLowerCase() ||
+        null;
+
+    const phone =
+        input.visitor?.phone?.trim() || input.sessionVisitorPhone?.trim() || null;
+
+    if (!fullName && !email && !phone) {
+        return null;
+    }
+
+    return {
+        fullName,
+        email,
+        phone,
+    };
+}
+
+function mergeCustomerProfiles(
+    storedProfile: CustomerProfile | null,
+    visitorProfile: CustomerProfile | null
+): CustomerProfile | null {
+    const fullName = storedProfile?.fullName || visitorProfile?.fullName || null;
+    const email = storedProfile?.email || visitorProfile?.email || null;
+    const phone = storedProfile?.phone || visitorProfile?.phone || null;
+
+    if (!fullName && !email && !phone) {
+        return null;
+    }
+
+    return {
+        fullName,
+        email,
+        phone,
+    };
+}
+
 export async function getContactProfile(
     contactId: string | null
 ): Promise<CustomerProfile | null> {
@@ -169,10 +222,14 @@ export async function getContactProfile(
         return null;
     }
 
+    if (!data) {
+        return null;
+    }
+
     return {
-        fullName: data?.full_name || null,
-        email: data?.email || null,
-        phone: data?.phone || null,
+        fullName: data.full_name || null,
+        email: data.email || null,
+        phone: data.phone || null,
     };
 }
 
@@ -226,7 +283,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
     const { data: existingSession, error: sessionError } = await supabase
         .from("webchat_sessions")
-        .select("conversation_id")
+        .select("conversation_id, visitor_name, visitor_email, visitor_phone")
         .eq("business_id", businessId)
         .eq("session_key", sessionId)
         .maybeSingle();
@@ -235,6 +292,13 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         console.error("Find webchat session error:", sessionError);
         throw new Error(sessionError.message);
     }
+
+    const visitorProfile = buildVisitorProfile({
+        visitor,
+        sessionVisitorName: existingSession?.visitor_name || null,
+        sessionVisitorEmail: existingSession?.visitor_email || null,
+        sessionVisitorPhone: existingSession?.visitor_phone || null,
+    });
 
     if (existingSession?.conversation_id) {
         conversationId = existingSession.conversation_id;
@@ -261,6 +325,17 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             contactId = currentConversation.contact_id as string;
         }
 
+        if (!contactId && visitorProfile) {
+            contactId = await findOrCreateContact({
+                businessId,
+                visitor: {
+                    name: visitorProfile.fullName || undefined,
+                    email: visitorProfile.email || undefined,
+                    phone: visitorProfile.phone || undefined,
+                },
+            });
+        }
+
         const conversationUpdate: Record<string, unknown> = {
             channel_id: webchatChannel.id,
         };
@@ -282,6 +357,17 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             );
         }
     } else {
+        if (!contactId && visitorProfile) {
+            contactId = await findOrCreateContact({
+                businessId,
+                visitor: {
+                    name: visitorProfile.fullName || undefined,
+                    email: visitorProfile.email || undefined,
+                    phone: visitorProfile.phone || undefined,
+                },
+            });
+        }
+
         const { data: conversation, error: conversationError } = await supabase
             .from("conversations")
             .insert({
@@ -319,9 +405,9 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
                 business_id: businessId,
                 session_key: sessionId,
                 conversation_id: conversationId,
-                visitor_name: visitor?.name ?? null,
-                visitor_email: visitor?.email ?? null,
-                visitor_phone: visitor?.phone ?? null,
+                visitor_name: visitorProfile?.fullName ?? visitor?.name ?? null,
+                visitor_email: visitorProfile?.email ?? visitor?.email ?? null,
+                visitor_phone: visitorProfile?.phone ?? visitor?.phone ?? null,
             });
 
         if (webchatSessionError) {
@@ -334,6 +420,46 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         throw new Error("This conversation is closed.");
     }
 
+    const storedProfileBeforeMessage = await getContactProfile(contactId);
+    let customerProfile = mergeCustomerProfiles(
+        storedProfileBeforeMessage,
+        visitorProfile
+    );
+
+    if (!contactId && customerProfile) {
+        contactId = await findOrCreateContact({
+            businessId,
+            visitor: {
+                name: customerProfile.fullName || undefined,
+                email: customerProfile.email || undefined,
+                phone: customerProfile.phone || undefined,
+            },
+        });
+
+        if (contactId) {
+            const { error: updateConversationContactError } = await supabase
+                .from("conversations")
+                .update({
+                    contact_id: contactId,
+                })
+                .eq("id", conversationId)
+                .eq("business_id", businessId);
+
+            if (updateConversationContactError) {
+                console.error(
+                    "Update conversation contact after customer profile fallback error:",
+                    updateConversationContactError
+                );
+            }
+
+            const storedProfileAfterCreate = await getContactProfile(contactId);
+            customerProfile = mergeCustomerProfiles(
+                storedProfileAfterCreate,
+                customerProfile
+            );
+        }
+    }
+
     const { error: userMessageError } = await supabase.from("messages").insert({
         business_id: businessId,
         conversation_id: conversationId,
@@ -344,6 +470,8 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             channel: "webchat",
             sessionId,
             visitor: visitor ?? null,
+            visitorProfile,
+            customerProfile,
             contactId,
             clientMessageId: input.clientMessageId ?? null,
         },
@@ -440,6 +568,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
                     output: handoffReply,
                     aiName,
                     analysis,
+                    customerProfile,
                 },
             });
 
@@ -490,21 +619,8 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             content: item.content,
         })) ?? [];
 
-    const storedCustomerProfile = await getContactProfile(contactId);
-
-    const visitorCustomerProfile = {
-        fullName: visitor?.name?.trim() || null,
-        email: visitor?.email?.trim().toLowerCase() || null,
-        phone: visitor?.phone?.trim() || null,
-    };
-
-    const customerProfile =
-        storedCustomerProfile ||
-        (visitorCustomerProfile.fullName ||
-            visitorCustomerProfile.email ||
-            visitorCustomerProfile.phone
-            ? visitorCustomerProfile
-            : null);
+    const storedProfileForAi = await getContactProfile(contactId);
+    customerProfile = mergeCustomerProfiles(storedProfileForAi, customerProfile);
 
     const aiReply = await generateAiReply({
         business,
@@ -636,11 +752,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
 async function findOrCreateContact(input: {
     businessId: string;
-    visitor?: {
-        name?: string;
-        email?: string;
-        phone?: string;
-    };
+    visitor?: WebchatVisitor;
 }): Promise<ContactId> {
     const { businessId, visitor } = input;
 
