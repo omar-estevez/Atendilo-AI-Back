@@ -12,6 +12,7 @@ import { executeMatchingFlows } from "../ai-flows/ai-flows.service.js";
 import { processBookingAutomation } from "../bookings/booking-automation.service.js";
 
 type ContactId = string | null;
+
 type ConversationStatus = "open" | "pending" | "closed";
 
 type ConversationAnalysis = {
@@ -80,16 +81,13 @@ function getWelcomeMessage(input: {
     return (
         channelConfig?.welcome_message ||
         channelConfig?.welcomeMessage ||
-        `Hi! I’m ${widgetTitle}. How can I help you today?`
+        `Hi! I’m ${widgetTitle}.
+How can I help you today?`
     );
 }
 
 function getPrimaryColor(channelConfig?: ChannelConfig | null) {
-    return (
-        channelConfig?.primary_color ||
-        channelConfig?.primaryColor ||
-        "#38bdf8"
-    );
+    return channelConfig?.primary_color || channelConfig?.primaryColor || "#38bdf8";
 }
 
 function getCaptureLeads(channelConfig?: ChannelConfig | null) {
@@ -130,10 +128,12 @@ function getHumanHandoffReply(userMessage: string, businessName: string) {
         value.includes("quiero");
 
     if (isSpanish) {
-        return `El equipo de ${businessName} está trabajando para conectarte con un agente. Por favor, espera un momento.`;
+        return `El equipo de ${businessName} está trabajando para conectarte con un agente.
+Por favor, espera un momento.`;
     }
 
-    return `The ${businessName} team is working to connect you with an agent. Please wait a moment.`;
+    return `The ${businessName} team is working to connect you with an agent.
+Please wait a moment.`;
 }
 
 function getBusinessName(business: Record<string, any>) {
@@ -153,7 +153,9 @@ function getCurrentAiModel() {
     return "mock";
 }
 
-export async function getContactProfile(contactId: string | null): Promise<CustomerProfile | null> {
+export async function getContactProfile(
+    contactId: string | null
+): Promise<CustomerProfile | null> {
     if (!contactId) return null;
 
     const { data, error } = await supabase
@@ -213,7 +215,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
     const businessName = getBusinessName(business);
 
-    const contactId = await findOrCreateContact({
+    let contactId = await findOrCreateContact({
         businessId,
         visitor,
     });
@@ -240,7 +242,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         const { data: currentConversation, error: currentConversationError } =
             await supabase
                 .from("conversations")
-                .select("status")
+                .select("status, contact_id")
                 .eq("id", conversationId)
                 .eq("business_id", businessId)
                 .maybeSingle();
@@ -254,6 +256,10 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
 
         currentConversationStatus =
             (currentConversation?.status as ConversationStatus) || "open";
+
+        if (!contactId && currentConversation?.contact_id) {
+            contactId = currentConversation.contact_id as string;
+        }
 
         const conversationUpdate: Record<string, unknown> = {
             channel_id: webchatChannel.id,
@@ -373,10 +379,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
                 });
 
             if (handoffMessageError) {
-                console.error(
-                    "Create human handoff message error:",
-                    handoffMessageError
-                );
+                console.error("Create human handoff message error:", handoffMessageError);
                 throw new Error(handoffMessageError.message);
             }
         }
@@ -487,7 +490,21 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             content: item.content,
         })) ?? [];
 
-    const customerProfile = await getContactProfile(contactId);
+    const storedCustomerProfile = await getContactProfile(contactId);
+
+    const visitorCustomerProfile = {
+        fullName: visitor?.name?.trim() || null,
+        email: visitor?.email?.trim().toLowerCase() || null,
+        phone: visitor?.phone?.trim() || null,
+    };
+
+    const customerProfile =
+        storedCustomerProfile ||
+        (visitorCustomerProfile.fullName ||
+            visitorCustomerProfile.email ||
+            visitorCustomerProfile.phone
+            ? visitorCustomerProfile
+            : null);
 
     const aiReply = await generateAiReply({
         business,

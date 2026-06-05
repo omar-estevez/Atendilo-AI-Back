@@ -1,5 +1,3 @@
-// src/modules/bookings/booking-automation.service.ts
-
 import { supabase } from "../../config/supabase.js";
 import { extractBookingDetailsWithAI } from "../ai/ai.service.js";
 import { getContactProfile } from "../webchat/webchat.service.js";
@@ -21,6 +19,21 @@ type BookingStatus = "pending" | "confirmed" | "completed" | "cancelled";
 
 function addMinutes(date: Date, minutes: number) {
     return new Date(date.getTime() + minutes * 60 * 1000);
+}
+
+async function getBusinessForBookingAutomation(businessId: string) {
+    const { data, error } = await supabase
+        .from("businesses")
+        .select("*")
+        .eq("id", businessId)
+        .maybeSingle();
+
+    if (error) {
+        console.error("Get business for booking automation error:", error);
+        return null;
+    }
+
+    return data || null;
 }
 
 async function getConversationHistory(conversationId: string) {
@@ -140,7 +153,7 @@ async function updateOrCreateBookingContact(input: {
 async function isBookingSlotAvailable(input: {
     businessId: string;
     scheduledAt: string;
-    durationMinutes?: number;
+    durationMinutes?: number | null;
 }) {
     const start = new Date(input.scheduledAt);
     const end = addMinutes(start, input.durationMinutes || 60);
@@ -155,6 +168,7 @@ async function isBookingSlotAvailable(input: {
 
     if (error) {
         console.error("Check booking availability error:", error);
+
         return {
             available: false,
             reason: "availability_check_failed",
@@ -187,19 +201,29 @@ async function bookingAlreadyExists(input: {
 }
 
 export async function processBookingAutomation(input: BookingAutomationInput) {
+    const lowerMessage = input.message.toLowerCase();
+
     const shouldCheckBooking =
         input.analysis.intent === "booking_request" ||
         input.analysis.intent === "booking_ready" ||
-        input.message.toLowerCase().includes("book") ||
-        input.message.toLowerCase().includes("booking") ||
-        input.message.toLowerCase().includes("appointment") ||
-        input.message.toLowerCase().includes("schedule") ||
-        input.message.toLowerCase().includes("cita") ||
-        input.message.toLowerCase().includes("agendar") ||
-        input.message.toLowerCase().includes("yes") ||
-        input.message.toLowerCase().includes("confirm") ||
-        input.message.toLowerCase().includes("sí") ||
-        input.message.toLowerCase().includes("si");
+        lowerMessage.includes("book") ||
+        lowerMessage.includes("booking") ||
+        lowerMessage.includes("appointment") ||
+        lowerMessage.includes("schedule") ||
+        lowerMessage.includes("reserve") ||
+        lowerMessage.includes("availability") ||
+        lowerMessage.includes("cita") ||
+        lowerMessage.includes("agendar") ||
+        lowerMessage.includes("reservar") ||
+        lowerMessage.includes("disponible") ||
+        lowerMessage.includes("yes") ||
+        lowerMessage.includes("confirm") ||
+        lowerMessage.includes("you have my data") ||
+        lowerMessage.includes("you have my info") ||
+        lowerMessage.includes("ya tienes mis datos") ||
+        lowerMessage.includes("ya tienes mi información") ||
+        lowerMessage.includes("sí") ||
+        lowerMessage.includes("si");
 
     if (!shouldCheckBooking) {
         return {
@@ -221,11 +245,12 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
         };
     }
 
+    const business = await getBusinessForBookingAutomation(input.businessId);
     const history = await getConversationHistory(input.conversationId);
-
     const contactProfile = await getContactProfile(input.contactId);
 
     const extracted = await extractBookingDetailsWithAI({
+        business,
         currentDateIso: new Date().toISOString(),
         customerProfile: contactProfile,
         messages: history.map((item) => ({
@@ -280,7 +305,7 @@ export async function processBookingAutomation(input: BookingAutomationInput) {
     const availability = await isBookingSlotAvailable({
         businessId: input.businessId,
         scheduledAt: extracted.scheduledAt,
-        durationMinutes: 60,
+        durationMinutes: extracted.durationMinutes || 60,
     });
 
     if (!availability.available) {

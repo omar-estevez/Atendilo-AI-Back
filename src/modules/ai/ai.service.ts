@@ -40,6 +40,14 @@ type KnowledgeBaseItem = {
     priority?: number | null;
 };
 
+type BusinessServiceItem = {
+    id?: string;
+    name?: string;
+    description?: string;
+    price?: number | string | null;
+    durationMinutes?: number | string | null;
+};
+
 type GenerateAiReplyInput = {
     business: BusinessRecord;
     history: MessageHistoryItem[];
@@ -79,11 +87,26 @@ function getBusinessName(business: BusinessRecord) {
 }
 
 function getBusinessSettings(business: BusinessRecord) {
-    if (!business.settings || typeof business.settings !== "object") {
+    if (!business?.settings || typeof business.settings !== "object") {
         return {};
     }
 
     return business.settings as Record<string, any>;
+}
+
+function getBusinessServices(business: BusinessRecord): BusinessServiceItem[] {
+    const settings = getBusinessSettings(business);
+    return Array.isArray(settings.services) ? settings.services : [];
+}
+
+function getBusinessBookingRules(business: BusinessRecord) {
+    const settings = getBusinessSettings(business);
+
+    if (!settings.bookingRules || typeof settings.bookingRules !== "object") {
+        return {};
+    }
+
+    return settings.bookingRules as Record<string, any>;
 }
 
 function getAiName(input: GenerateAiReplyInput) {
@@ -124,6 +147,28 @@ function formatValue(value: unknown) {
     }
 
     return String(value);
+}
+
+function getBusinessTimezone(business?: BusinessRecord | null) {
+    return business?.timezone || "America/Chicago";
+}
+
+function toNumber(value: unknown) {
+    if (value === null || value === undefined || value === "") return null;
+
+    const parsed = Number(value);
+
+    if (Number.isNaN(parsed)) return null;
+
+    return parsed;
+}
+
+function normalizeText(value: string) {
+    return value
+        .toLowerCase()
+        .replace(/[^\w\s+]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
 async function getActiveKnowledgeBase(
@@ -188,25 +233,23 @@ function formatBusinessProfile(business: BusinessRecord) {
 }
 
 function formatServicesAndPricing(business: BusinessRecord) {
-    const settings = getBusinessSettings(business);
-    const services = Array.isArray(settings.services) ? settings.services : [];
+    const services = getBusinessServices(business);
 
     if (!services.length) {
         return "No structured services or pricing were provided.";
     }
 
     return services
-        .map((service: Record<string, any>, index: number) => {
+        .map((service, index) => {
+            const price = toNumber(service.price);
+            const duration = toNumber(service.durationMinutes);
+
             return [
                 `Service ${index + 1}`,
                 `Name: ${formatValue(service.name)}`,
                 `Description: ${formatValue(service.description)}`,
-                `Price: ${service.price !== undefined && service.price !== null ? `$${service.price}` : "Not provided"}`,
-                `Duration: ${service.durationMinutes !== undefined &&
-                    service.durationMinutes !== null
-                    ? `${service.durationMinutes} minutes`
-                    : "Not provided"
-                }`,
+                `Price: ${price !== null ? `$${price}` : "Not provided"}`,
+                `Duration: ${duration !== null ? `${duration} minutes` : "Not provided"}`,
             ].join("\n");
         })
         .join("\n\n---\n\n");
@@ -236,11 +279,7 @@ function formatBusinessHours(business: BusinessRecord) {
 }
 
 function formatBookingSettings(business: BusinessRecord) {
-    const settings = getBusinessSettings(business);
-    const bookingRules =
-        settings.bookingRules && typeof settings.bookingRules === "object"
-            ? settings.bookingRules
-            : {};
+    const bookingRules = getBusinessBookingRules(business);
 
     return [
         `Minimum Notice: ${formatValue(bookingRules.minimumNotice)}`,
@@ -299,15 +338,16 @@ ${formatHumanHandoffRules(business)}
 function findServiceFromMessage(
     business: BusinessRecord,
     userMessage: string
-): Record<string, any> | null {
-    const settings = getBusinessSettings(business);
-    const services = Array.isArray(settings.services) ? settings.services : [];
-    const normalizedMessage = userMessage.toLowerCase();
+): BusinessServiceItem | null {
+    const services = getBusinessServices(business);
+    const normalizedMessage = normalizeText(userMessage);
 
     for (const service of services) {
-        const serviceName = String(service.name || "").toLowerCase();
+        const serviceName = normalizeText(String(service.name || ""));
 
-        if (serviceName && normalizedMessage.includes(serviceName)) {
+        if (!serviceName) continue;
+
+        if (normalizedMessage.includes(serviceName)) {
             return service;
         }
 
@@ -414,10 +454,15 @@ CUSTOMER PROFILE ALREADY KNOWN:
 ${JSON.stringify(customerProfile, null, 2)}
 
 IMPORTANT CONTACT RULES:
-- The customer profile comes from the web chat lead form.
+- The customer profile comes from the web chat lead form or the saved contact.
 - If customer profile has name, email, or phone, count those fields as already collected.
+- If customer profile has at least one of name, email, or phone, you MUST NOT ask for contact information again.
 - Do NOT ask again for name, email, or phone if they are already available in the customer profile.
+- If the customer says "you have my data", "you have my info", "you already have my data", "ya tienes mis datos", "ya tienes mi información", or similar, check the customer profile first.
+- If customer profile has name, email, or phone, do not ask for contact information again.
+- If contact data exists and the customer says you already have it, continue with the booking flow and ask only for missing service, date, time, or final confirmation.
 - If name is missing but email or phone exists, you may continue the booking conversation without asking for the name unless the business specifically requires it.
+- If a booking request already includes service, date, and time, and customer profile has contact info, summarize the booking request and ask for confirmation.
 
 MAIN JOB:
 - Answer customer questions clearly.
@@ -462,6 +507,9 @@ CRITICAL CONTACT RULE:
 - Do NOT say the booking is confirmed if no contact identifier is available.
 - Do NOT say "you're all set" if no contact identifier is available.
 - Do NOT finalize the booking without at least one of: name, email, or phone.
+- If known contact identifier exists is "no", you MUST ask for contact information before final booking confirmation.
+- If known contact identifier exists is "yes", you MUST NOT ask for name, email, or phone again.
+- If known contact identifier exists is "yes" and service/date/time are available, ask only for final confirmation.
 
 IF CONTACT IDENTIFIER IS ALREADY KNOWN:
 - If the customer profile already contains name, phone, or email, count those as collected.
@@ -649,11 +697,14 @@ function generateSafeFallbackReply(input: GenerateAiReplyInput) {
         );
 
         if (matchedService) {
+            const price = toNumber(matchedService.price);
+            const priceText = price !== null ? `$${price}` : "the listed price";
+
             if (isSpanish) {
-                return `${matchedService.name} empieza desde $${matchedService.price}. ${matchedService.description || ""}`.trim();
+                return `${matchedService.name} empieza desde ${priceText}. ${matchedService.description || ""}`.trim();
             }
 
-            return `${matchedService.name} starts at $${matchedService.price}. ${matchedService.description || ""}`.trim();
+            return `${matchedService.name} starts at ${priceText}. ${matchedService.description || ""}`.trim();
         }
     }
 
@@ -1077,11 +1128,13 @@ export type ExtractedBookingDetails = {
     serviceName: string | null;
     scheduledAt: string | null;
     estimatedValue: number | null;
+    durationMinutes: number | null;
     notes: string | null;
     missingFields: string[];
 };
 
 type ExtractBookingDetailsInput = {
+    business?: BusinessRecord | null;
     currentDateIso: string;
     customerProfile?: {
         fullName?: string | null;
@@ -1094,11 +1147,144 @@ type ExtractBookingDetailsInput = {
     }[];
 };
 
-function safeParseBookingJson(raw: string): ExtractedBookingDetails {
+function getConversationTextForExtraction(input: ExtractBookingDetailsInput) {
+    return input.messages
+        .slice(-30)
+        .map((message) => `${message.senderType}: ${message.content}`)
+        .join("\n");
+}
+
+function formatServicesForBookingExtraction(business?: BusinessRecord | null) {
+    if (!business) return "No structured services were provided.";
+
+    const services = getBusinessServices(business);
+
+    if (!services.length) return "No structured services were provided.";
+
+    return services
+        .map((service, index) => {
+            const price = toNumber(service.price);
+            const duration = toNumber(service.durationMinutes);
+
+            return [
+                `Service ${index + 1}`,
+                `Name: ${formatValue(service.name)}`,
+                `Description: ${formatValue(service.description)}`,
+                `Price: ${price !== null ? price : "Not provided"}`,
+                `Duration Minutes: ${duration !== null ? duration : "Not provided"}`,
+            ].join("\n");
+        })
+        .join("\n\n---\n\n");
+}
+
+function formatBookingSettingsForExtraction(business?: BusinessRecord | null) {
+    if (!business) return "No booking settings were provided.";
+
+    return formatBookingSettings(business);
+}
+
+function findStructuredServiceMatch(
+    business: BusinessRecord | null | undefined,
+    text: string
+): BusinessServiceItem | null {
+    if (!business) return null;
+
+    return findServiceFromMessage(business, text);
+}
+
+function enrichBookingDetailsWithBusinessData(
+    details: ExtractedBookingDetails,
+    input: ExtractBookingDetailsInput
+): ExtractedBookingDetails {
+    const business = input.business || null;
+    const conversationText = getConversationTextForExtraction(input);
+    const serviceSearchText = [details.serviceName || "", conversationText].join(
+        "\n"
+    );
+
+    const matchedService = findStructuredServiceMatch(business, serviceSearchText);
+
+    const serviceName =
+        details.serviceName ||
+        (matchedService?.name ? String(matchedService.name) : null);
+
+    const estimatedValue =
+        details.estimatedValue !== null && !Number.isNaN(details.estimatedValue)
+            ? details.estimatedValue
+            : matchedService
+                ? toNumber(matchedService.price)
+                : null;
+
+    const durationMinutes = matchedService
+        ? toNumber(matchedService.durationMinutes)
+        : details.durationMinutes;
+
+    const contactIdentifierExists =
+        Boolean(details.customerName) ||
+        Boolean(details.email) ||
+        Boolean(details.phone) ||
+        Boolean(input.customerProfile?.fullName) ||
+        Boolean(input.customerProfile?.email) ||
+        Boolean(input.customerProfile?.phone);
+
+    const missingFields = new Set(
+        Array.isArray(details.missingFields) ? details.missingFields : []
+    );
+
+    if (contactIdentifierExists) {
+        missingFields.delete("contactIdentifier");
+        missingFields.delete("customerName");
+    } else {
+        missingFields.add("contactIdentifier");
+    }
+
+    if (serviceName) {
+        missingFields.delete("serviceName");
+    } else {
+        missingFields.add("serviceName");
+    }
+
+    if (details.scheduledAt) {
+        missingFields.delete("scheduledAt");
+    } else {
+        missingFields.add("scheduledAt");
+    }
+
+    if (details.isConfirmed) {
+        missingFields.delete("confirmation");
+    } else if (details.isBookingIntent) {
+        missingFields.add("confirmation");
+    }
+
+    const safeIsConfirmed =
+        details.isConfirmed &&
+        contactIdentifierExists &&
+        Boolean(serviceName) &&
+        Boolean(details.scheduledAt);
+
+    return {
+        ...details,
+        isConfirmed: safeIsConfirmed,
+        customerName: details.customerName || input.customerProfile?.fullName || null,
+        email: details.email || input.customerProfile?.email || null,
+        phone: details.phone || input.customerProfile?.phone || null,
+        serviceName,
+        estimatedValue,
+        durationMinutes,
+        missingFields: Array.from(missingFields).filter(
+            (field) => field !== "parse_failed" && field !== "ai_error"
+        ),
+    };
+}
+
+function safeParseBookingJson(
+    raw: string,
+    input: ExtractBookingDetailsInput
+): ExtractedBookingDetails {
     try {
         const parsed = JSON.parse(raw);
 
-        return {
+        const baseDetails: ExtractedBookingDetails = {
             isBookingIntent: Boolean(parsed.isBookingIntent),
             isConfirmed: Boolean(parsed.isConfirmed),
             customerName:
@@ -1125,6 +1311,10 @@ function safeParseBookingJson(raw: string): ExtractedBookingDetails {
                 parsed.estimatedValue === null || parsed.estimatedValue === undefined
                     ? null
                     : Number(parsed.estimatedValue),
+            durationMinutes:
+                parsed.durationMinutes === null || parsed.durationMinutes === undefined
+                    ? null
+                    : Number(parsed.durationMinutes),
             notes:
                 typeof parsed.notes === "string" && parsed.notes.trim()
                     ? parsed.notes.trim()
@@ -1133,27 +1323,30 @@ function safeParseBookingJson(raw: string): ExtractedBookingDetails {
                 ? parsed.missingFields.map(String)
                 : [],
         };
+
+        return enrichBookingDetailsWithBusinessData(baseDetails, input);
     } catch {
-        return {
-            isBookingIntent: false,
-            isConfirmed: false,
-            customerName: null,
-            email: null,
-            phone: null,
-            serviceName: null,
-            scheduledAt: null,
-            estimatedValue: null,
-            notes: null,
-            missingFields: ["parse_failed"],
-        };
+        return enrichBookingDetailsWithBusinessData(
+            {
+                isBookingIntent: false,
+                isConfirmed: false,
+                customerName: null,
+                email: null,
+                phone: null,
+                serviceName: null,
+                scheduledAt: null,
+                estimatedValue: null,
+                durationMinutes: null,
+                notes: null,
+                missingFields: ["parse_failed"],
+            },
+            input
+        );
     }
 }
 
 function buildBookingExtractionPrompt(input: ExtractBookingDetailsInput) {
-    const historyText = input.messages
-        .slice(-30)
-        .map((message) => `${message.senderType}: ${message.content}`)
-        .join("\n");
+    const historyText = getConversationTextForExtraction(input);
 
     const customerProfile = {
         name: input.customerProfile?.fullName || null,
@@ -1161,11 +1354,29 @@ function buildBookingExtractionPrompt(input: ExtractBookingDetailsInput) {
         phone: input.customerProfile?.phone || null,
     };
 
+    const businessName = input.business ? getBusinessName(input.business) : null;
+    const businessTimezone = getBusinessTimezone(input.business);
+
     return `
 You extract booking details from a customer conversation for any type of business that accepts appointments, reservations, service calls, consultations, estimates, or scheduled visits.
 
 Current date/time ISO:
 ${input.currentDateIso}
+
+Business timezone:
+${businessTimezone}
+
+Business name:
+${businessName || "Not provided"}
+
+Structured services and pricing:
+${formatServicesForBookingExtraction(input.business)}
+
+Business hours:
+${input.business ? formatBusinessHours(input.business) : "No business hours were provided."}
+
+Booking settings:
+${formatBookingSettingsForExtraction(input.business)}
 
 Conversation:
 ${historyText}
@@ -1176,17 +1387,28 @@ ${JSON.stringify(customerProfile, null, 2)}
 Return ONLY valid JSON.
 
 Rules:
+- Use the structured services list as the source of truth for serviceName, estimatedValue, and durationMinutes.
+- If the customer mentions a service that matches a structured service, return the structured service name exactly.
+- If the structured service has a price, use it as estimatedValue.
+- If the structured service has durationMinutes, use it as durationMinutes.
 - If customer profile has name, email, or phone, count that as a valid contact identifier.
 - Do not mark contactIdentifier as missing if customer profile has name, email, or phone.
+- If the customer says "you have my data", "you have my info", "you already have my data", "ya tienes mis datos", "ya tienes mi información", "ya te di mis datos", or similar, use the customer profile as the contact identifier when available.
 - isBookingIntent true if the customer wants to schedule, book, reserve, request an appointment, request availability, request a consultation, request a quote visit, or confirm an appointment.
-- isConfirmed true only if the customer clearly confirms they want to book now, for example: yes, confirm, go ahead, schedule it, book it, sí, confirmo.
-- scheduledAt must be ISO 8601.
-- If customer says tomorrow, interpret it based on the current date.
+- isConfirmed true only if the customer clearly confirms they want to book now, for example: yes, confirm, go ahead, schedule it, book it, sí, confirmo, you have my data, you have my info, ya tienes mis datos, ya te di mis datos.
+- scheduledAt must be ISO 8601 with timezone offset.
+- Use the business timezone when interpreting dates and times.
+- Business timezone is: ${businessTimezone}.
+- If customer says tomorrow, interpret it in the business timezone.
+- If customer says a weekday, interpret the next upcoming occurrence of that weekday in the business timezone.
+- If customer says "12", "12 pm", "noon", or "at 12", interpret it as 12:00 PM local business time unless the conversation clearly says 12 AM.
+- Do NOT return UTC time with Z unless the customer explicitly provides UTC.
+- Return scheduledAt with the local timezone offset, for example: 2026-06-06T12:00:00-05:00.
 - If date/time is missing, scheduledAt must be null.
-- customerName can come from a name the customer gave in chat.
+- customerName can come from a name the customer gave in chat or from the customer profile.
 - If the customer gave only an email or phone, keep customerName null unless a clear name exists.
 - serviceName must be the requested service. Example: basic wash, exterior wash, haircut, consultation, inspection, repair, cleaning, estimate.
-- estimatedValue should be a number only if the conversation clearly contains a price.
+- estimatedValue should be a number only if structured services or conversation clearly contains a price.
 - notes should summarize the booking request.
 - The customer may already have provided name, email, or phone through the web chat lead form.
 - If the conversation contains a phone or email, customerName may be null.
@@ -1196,6 +1418,7 @@ Rules:
 - If customer profile has no name, no email, and no phone, contactIdentifier is missing.
 - If contactIdentifier is missing, isConfirmed must be false even if the customer says yes.
 - Do not mark the booking as confirmed unless contactIdentifier, serviceName, and scheduledAt are available.
+- If the requested time appears outside business hours in the business timezone, still extract the requested scheduledAt, but mention it in notes.
 
 JSON shape:
 {
@@ -1207,8 +1430,9 @@ JSON shape:
   "serviceName": null,
   "scheduledAt": null,
   "estimatedValue": null,
+  "durationMinutes": null,
   "notes": null,
-  "missingFields": ["customerName", "serviceName", "scheduledAt", "confirmation"]
+  "missingFields": ["contactIdentifier", "serviceName", "scheduledAt", "confirmation"]
 }
 `.trim();
 }
@@ -1229,7 +1453,7 @@ export async function extractBookingDetailsWithAI(
             const result = await model.generateContent(prompt);
             const raw = result.response.text();
 
-            return safeParseBookingJson(raw);
+            return safeParseBookingJson(raw, input);
         }
 
         if (env.AI_PROVIDER === "groq") {
@@ -1256,7 +1480,8 @@ export async function extractBookingDetailsWithAI(
             });
 
             return safeParseBookingJson(
-                response.choices[0]?.message?.content || "{}"
+                response.choices[0]?.message?.content || "{}",
+                input
             );
         }
 
@@ -1281,21 +1506,28 @@ export async function extractBookingDetailsWithAI(
             },
         });
 
-        return safeParseBookingJson(response.choices[0]?.message?.content || "{}");
+        return safeParseBookingJson(
+            response.choices[0]?.message?.content || "{}",
+            input
+        );
     } catch (error) {
         console.error("Extract booking details AI error:", error);
 
-        return {
-            isBookingIntent: false,
-            isConfirmed: false,
-            customerName: null,
-            email: null,
-            phone: null,
-            serviceName: null,
-            scheduledAt: null,
-            estimatedValue: null,
-            notes: null,
-            missingFields: ["ai_error"],
-        };
+        return enrichBookingDetailsWithBusinessData(
+            {
+                isBookingIntent: false,
+                isConfirmed: false,
+                customerName: null,
+                email: null,
+                phone: null,
+                serviceName: null,
+                scheduledAt: null,
+                estimatedValue: null,
+                durationMinutes: null,
+                notes: null,
+                missingFields: ["ai_error"],
+            },
+            input
+        );
     }
 }
