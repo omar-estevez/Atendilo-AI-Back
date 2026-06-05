@@ -12,7 +12,6 @@ import { executeMatchingFlows } from "../ai-flows/ai-flows.service.js";
 import { processBookingAutomation } from "../bookings/booking-automation.service.js";
 
 type ContactId = string | null;
-
 type ConversationStatus = "open" | "pending" | "closed";
 
 type ConversationAnalysis = {
@@ -93,11 +92,32 @@ How can I help you today?`
 }
 
 function getPrimaryColor(channelConfig?: ChannelConfig | null) {
-    return channelConfig?.primary_color || channelConfig?.primaryColor || "#38bdf8";
+    return (
+        channelConfig?.primary_color ||
+        channelConfig?.primaryColor ||
+        "#38bdf8"
+    );
 }
 
 function getCaptureLeads(channelConfig?: ChannelConfig | null) {
     return channelConfig?.capture_leads ?? channelConfig?.captureLeads ?? true;
+}
+
+function getBusinessName(business: Record<string, any>) {
+    return (
+        business.name ||
+        business.business_name ||
+        business.company_name ||
+        "the business"
+    );
+}
+
+function getCurrentAiModel() {
+    if (env.AI_PROVIDER === "gemini") return env.GEMINI_MODEL;
+    if (env.AI_PROVIDER === "openai") return "gpt-4.1-mini";
+    if (env.AI_PROVIDER === "groq") return env.GROQ_MODEL;
+
+    return "mock";
 }
 
 function isHumanAgentRequest(text: string) {
@@ -142,23 +162,6 @@ Por favor, espera un momento.`;
 Please wait a moment.`;
 }
 
-function getBusinessName(business: Record<string, any>) {
-    return (
-        business.name ||
-        business.business_name ||
-        business.company_name ||
-        "the business"
-    );
-}
-
-function getCurrentAiModel() {
-    if (env.AI_PROVIDER === "gemini") return env.GEMINI_MODEL;
-    if (env.AI_PROVIDER === "openai") return "gpt-4.1-mini";
-    if (env.AI_PROVIDER === "groq") return env.GROQ_MODEL;
-
-    return "mock";
-}
-
 function buildVisitorProfile(input: {
     visitor?: WebchatVisitor;
     sessionVisitorName?: string | null;
@@ -166,7 +169,9 @@ function buildVisitorProfile(input: {
     sessionVisitorPhone?: string | null;
 }): CustomerProfile | null {
     const fullName =
-        input.visitor?.name?.trim() || input.sessionVisitorName?.trim() || null;
+        input.visitor?.name?.trim() ||
+        input.sessionVisitorName?.trim() ||
+        null;
 
     const email =
         input.visitor?.email?.trim().toLowerCase() ||
@@ -174,7 +179,9 @@ function buildVisitorProfile(input: {
         null;
 
     const phone =
-        input.visitor?.phone?.trim() || input.sessionVisitorPhone?.trim() || null;
+        input.visitor?.phone?.trim() ||
+        input.sessionVisitorPhone?.trim() ||
+        null;
 
     if (!fullName && !email && !phone) {
         return null;
@@ -204,6 +211,10 @@ function mergeCustomerProfiles(
         email,
         phone,
     };
+}
+
+function buildAiSummaryFromReply(reply: string) {
+    return reply.length > 300 ? `${reply.slice(0, 297)}...` : reply;
 }
 
 export async function getContactProfile(
@@ -421,6 +432,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
     }
 
     const storedProfileBeforeMessage = await getContactProfile(contactId);
+
     let customerProfile = mergeCustomerProfiles(
         storedProfileBeforeMessage,
         visitorProfile
@@ -453,6 +465,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             }
 
             const storedProfileAfterCreate = await getContactProfile(contactId);
+
             customerProfile = mergeCustomerProfiles(
                 storedProfileAfterCreate,
                 customerProfile
@@ -507,7 +520,10 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
                 });
 
             if (handoffMessageError) {
-                console.error("Create human handoff message error:", handoffMessageError);
+                console.error(
+                    "Create human handoff message error:",
+                    handoffMessageError
+                );
                 throw new Error(handoffMessageError.message);
             }
         }
@@ -620,6 +636,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         })) ?? [];
 
     const storedProfileForAi = await getContactProfile(contactId);
+
     customerProfile = mergeCustomerProfiles(storedProfileForAi, customerProfile);
 
     const aiReply = await generateAiReply({
@@ -641,6 +658,35 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         aiReply,
     });
 
+    const bookingAutomationResult: any = await processBookingAutomation({
+        businessId,
+        conversationId,
+        contactId,
+        message,
+        aiReply,
+        analysis,
+    });
+
+    const finalAiReply =
+        typeof bookingAutomationResult?.replyOverride === "string" &&
+            bookingAutomationResult.replyOverride.trim()
+            ? bookingAutomationResult.replyOverride.trim()
+            : aiReply;
+
+    const bookingChangedReply = finalAiReply !== aiReply;
+
+    const finalContactId =
+        bookingAutomationResult?.contactId || contactId || null;
+
+    contactId = finalContactId;
+
+    const finalAnalysis: ConversationAnalysis = bookingChangedReply
+        ? {
+            ...analysis,
+            aiSummary: buildAiSummaryFromReply(finalAiReply),
+        }
+        : analysis;
+
     const currentAiModel = getCurrentAiModel();
 
     const { error: aiMessageError } = await supabase.from("messages").insert({
@@ -648,12 +694,14 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         conversation_id: conversationId,
         sender_type: "ai",
         sender_profile_id: null,
-        content: aiReply,
+        content: finalAiReply,
         metadata: {
             channel: "webchat",
             model: currentAiModel,
             aiName,
-            analysis,
+            analysis: finalAnalysis,
+            originalAiReply: bookingChangedReply ? aiReply : null,
+            bookingAutomation: bookingAutomationResult ?? null,
             customerProfile,
         },
     });
@@ -663,7 +711,7 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         throw new Error(aiMessageError.message);
     }
 
-    const nextStatus: ConversationStatus = analysis.needsHuman
+    const nextStatus: ConversationStatus = finalAnalysis.needsHuman
         ? "pending"
         : "open";
 
@@ -671,12 +719,12 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         status: nextStatus,
         last_message_at: new Date().toISOString(),
         channel_id: webchatChannel.id,
-        intent: analysis.intent,
-        urgency: analysis.urgency,
-        sentiment: analysis.sentiment,
-        ai_score: analysis.aiScore,
-        ai_summary: analysis.aiSummary,
-        needs_human: analysis.needsHuman,
+        intent: finalAnalysis.intent,
+        urgency: finalAnalysis.urgency,
+        sentiment: finalAnalysis.sentiment,
+        ai_score: finalAnalysis.aiScore,
+        ai_summary: finalAnalysis.aiSummary,
+        needs_human: finalAnalysis.needsHuman,
         ai_analyzed_at: new Date().toISOString(),
     };
 
@@ -703,14 +751,16 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
             type: "ai_reply",
             status: "success",
             title: `${aiName} replied to web chat message`,
-            description: aiReply,
+            description: finalAiReply,
             metadata: {
                 channel: "webchat",
                 input: message,
-                output: aiReply,
+                output: finalAiReply,
+                originalOutput: bookingChangedReply ? aiReply : null,
                 model: currentAiModel,
                 aiName,
-                analysis,
+                analysis: finalAnalysis,
+                bookingAutomation: bookingAutomationResult ?? null,
                 customerProfile,
             },
         });
@@ -724,29 +774,20 @@ export async function processWebchatMessage(input: WebchatMessageBody) {
         conversationId,
         contactId,
         analysis: {
-            ...analysis,
-            needsHuman: analysis.intent === "human_handoff",
+            ...finalAnalysis,
+            needsHuman: finalAnalysis.intent === "human_handoff",
         },
         isNewConversation,
         followUpRequired: false,
         source: "webchat",
     });
 
-    const bookingAutomationResult = await processBookingAutomation({
-        businessId,
+    return {
+        reply: finalAiReply,
         conversationId,
         contactId,
-        message,
-        aiReply,
-        analysis,
-    });
-
-    return {
-        reply: aiReply,
-        conversationId,
-        contactId: bookingAutomationResult.contactId || contactId,
         status: nextStatus,
-        analysis,
+        analysis: finalAnalysis,
         booking: bookingAutomationResult,
     };
 }
